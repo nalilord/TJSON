@@ -2,14 +2,32 @@
 (*                                                                            *)
 (*  Delphi JSON Parser Class                                                  *)
 (*                                                                            *)
-(*  Version     : 1.05 (2024-04-20)                                           *)
+(*  Version     : 1.07 (2025-03-24)                                           *)
 (*  License     : GPL v3.0                                                    *)
 (*  Author      : NaliLord / DMA (Daniel M.)                                  *)
 (*                                                                            *)
-(*  Copyright (c) 2024                                                        *)
+(*  Copyright (c) 2025                                                        *)
 (*                                                                            *)
 (*  History:                                                                  *)
 (*  ========================================================================  *)
+(*                                                                            *)
+(*  - 1.07 [2025-03-24] DMA: Updated the Template System                      *)
+(*    Renamed "Default" to "Empty"                                            *)
+(*    Added "Default" to set template default values                          *)
+(*                                                                            *)
+(*    *Note* "Default" references the last added field                        *)
+(*                                                                            *)
+(*  - 1.06 [2025-02-19] DMA: Updated the Template System                      *)
+(*    Added that template names can be used as a string value                 *)
+(*    Added that templates can now be used nested by name                     *)
+(*    Added new template flags to omit empty keys                             *)
+(*    Changed that template "Fill" now supports nil and "TJSONObject"         *)
+(*    Added "AssignTo" functionality to "TJSONValue"                          *)
+(*    Added "ToString" functionality for "TJSONObject"                        *)
+(*    Added "ToString" functionality for "TJSONArray"                         *)
+(*                                                                            *)
+(*    *Note* "ToString" will output a write mode condensed JSON string        *)
+(*    *Note* Template name values must be ignored in "Fill" when using them   *)
 (*                                                                            *)
 (*  - 1.05 [2024-04-20] DMA: Parser now supports JSON5 files for reading      *)
 (*                                                                            *)
@@ -29,7 +47,7 @@
 
 unit XENOME.JSON;
 
-{$WARN DUPLICATE_CTOR_DTOR OFF} // <- fuck diz shit, does not help at all... disable the warning in project options to supress it!
+{$WARN DUPLICATE_CTOR_DTOR OFF} // <- fuck diz shit, does not help at all... disable the warning in project options to supress it or copy this to the .dpr!
 
 interface
 
@@ -38,8 +56,13 @@ uses
 
 type
   TJSONType = (jtNull, jtInteger, jtFloat, jtString, jtBoolean, jtObject, jtArray);
+  TJSONTemplateType = (jttNull, jttInteger, jttFloat, jttString, jttBoolean, jttObject, jttArray, jttName, jttUnixTime, jttTemplate, jttCallback);
+  TJSONTemplateFlag = (tfOmitEmpty);
   TJSONStringWriteMode = (jswmReadable, jswmCondensed);
   TJSONExtension = (jeDefault, jeJSON5);
+
+  TJSONTemplateFlags = set of TJSONTemplateFlag;
+
 
   TJSONTemplate = class;
   TJSON = class;
@@ -52,6 +75,10 @@ type
   TJSONObject = class;
   TJSONArray = class;
 
+  TJSONClass = class of TJSONValue;
+
+  TJSONTemplateFillCallback = procedure(ATemplateName, AKeyName: String; var AValue: TJSONValue) of object;
+
   EJSONException = class(Exception)
   private
     FMessage: String;
@@ -60,27 +87,48 @@ type
     property Message: String read FMessage;
   end;
 
-  TJSONField = record
+  TJSONTemplateField = record
     Name: String;
-    Typ: TJSONType;
+    Typ: TJSONTemplateType;
+    Nested: TJSONTemplate;
+    Default: TJSONValue;
+    Callback: TJSONTemplateFillCallback;
   end;
 
   TJSONTemplate = class(TPersistent)
   private
+    FName: String;
+    FFlags: TJSONTemplateFlags;
     FJSON: TJSON;
     FCritSec: TCriticalSection;
-    FValues: Array of record Name: String; JSONType: TJSONType; end;
+    FValues: Array of TJSONTemplateField;
+    FLastAdded: Integer;
+    FOnTemplateFillCallback: TJSONTemplateFillCallback;
   protected
+    function GetTemplateFieldCount: Integer;
+    function Add(AName: String; AType: TJSONTemplateType; ATemplate: TJSONTemplate; ACallback: TJSONTemplateFillCallback): TJSONTemplate; overload;
+    procedure Cleanup;
+    procedure DoTemplateFillCallback(ATemplateName, AKeyName: String; var AValue: TJSONValue);
   public
-    constructor Create;
+    constructor Create(AName: String);
     destructor Destroy; override;
     procedure Clear;
+    function SetFlag(AFlag: TJSONTemplateFlag): TJSONTemplate;
+    function SetFlags(AFlags: TJSONTemplateFlags): TJSONTemplate;
     function SetValue(AName: String; const AValue: Variant): Boolean;
     function Add(AName: String; AType: TJSONType): TJSONTemplate; overload;
-    function Add(AField: TJSONField): TJSONTemplate; overload;
-    function Default: TJSON;
+    function Add(AName: String; AType: TJSONTemplateType): TJSONTemplate; overload;
+    function Add(AName: String; ATemplate: TJSONTemplate): TJSONTemplate; overload;
+    function Add(AName: String; ATemplateName: String): TJSONTemplate; overload;
+    function Add(AName: String; ACallback: TJSONTemplateFillCallback): TJSONTemplate; overload;
+    function Add(AField: TJSONTemplateField): TJSONTemplate; overload;
+    function Default(AValue: TJSONValue): TJSONTemplate; overload;
+    function Empty(AUseDefaults: Boolean = True): TJSON;
     function Fill(AValues: Array of const): TJSON;
+    property Name: String read FName;
+    property Flags: TJSONTemplateFlags read FFlags write FFlags;
     property JSON: TJSON read FJSON;
+    property OnTemplateFillCallback: TJSONTemplateFillCallback read FOnTemplateFillCallback write FOnTemplateFillCallback;
   end;
 
   TJSON = class(TPersistent)
@@ -110,6 +158,7 @@ type
     destructor Destroy; override;
     function IsEmpty: Boolean; virtual;
     function WriteToString(AWriteMode: TJSONStringWriteMode = jswmReadable): String; virtual;
+    function WriteToFile(const AFileName: String; AWriteMode: TJSONStringWriteMode = jswmReadable): String; virtual;
     function RootNewArray: TJSONArray;
     function RootNewObject: TJSONObject;
     procedure Assign(ASource: TPersistent); override;
@@ -140,6 +189,7 @@ type
     function GetIsString: Boolean;
     function GetTyp: TJSONType;
   protected
+    function GetClass: TJSONClass; virtual;
     function GetAsValue: TValue; virtual;
     function GetAsArray: TJSONArray; virtual; abstract;
     function GetAsBoolean: Boolean; virtual; abstract;
@@ -147,9 +197,11 @@ type
     function GetAsInteger: Int64; virtual; abstract;
     function GetAsObject: TJSONObject; virtual; abstract;
     function GetAsString: String; virtual; abstract;
+    procedure AssignTo(Dest: TPersistent); override;
   public
-    constructor Create;
+    constructor Create; virtual;
     function IsEmpty: Boolean; virtual; abstract;
+    function Copy: TJSONValue; virtual;
     property Typ: TJSONType        read GetTyp;
     property IsNull: Boolean       read GetIsNull;
     property IsString: Boolean     read GetIsString;
@@ -168,6 +220,7 @@ type
 
   TJSONNull = class(TJSONValue)
   protected
+    function GetClass: TJSONClass; override;
     function GetAsArray: TJSONArray; override;
     function GetAsBoolean: Boolean; override;
     function GetAsFloat: Extended; override;
@@ -175,7 +228,7 @@ type
     function GetAsObject: TJSONObject; override;
     function GetAsString: String; override;
   public
-    constructor Create;
+    constructor Create; override;
     function IsEmpty: Boolean; override;
   end;
 
@@ -183,6 +236,7 @@ type
   private
     FValue: String;
   protected
+    function GetClass: TJSONClass; override;
     function GetAsValue: TValue; override;
     function GetAsArray: TJSONArray; override;
     function GetAsBoolean: Boolean; override;
@@ -191,7 +245,8 @@ type
     function GetAsObject: TJSONObject; override;
     function GetAsString: String; override;
   public
-    constructor Create(AValue: String);
+    constructor Create; override;
+    constructor CreateFrom(AValue: String);
     function IsEmpty: Boolean; override;
   end;
 
@@ -199,6 +254,7 @@ type
   private
     FValue: Int64;
   protected
+    function GetClass: TJSONClass; override;
     function GetAsValue: TValue; override;
     function GetAsArray: TJSONArray; override;
     function GetAsBoolean: Boolean; override;
@@ -207,7 +263,8 @@ type
     function GetAsObject: TJSONObject; override;
     function GetAsString: String; override;
   public
-    constructor Create(AValue: Int64);
+    constructor Create; override;
+    constructor CreateFrom(AValue: Int64);
     function IsEmpty: Boolean; override;
   end;
 
@@ -215,6 +272,7 @@ type
   private
     FValue: Extended;
   protected
+    function GetClass: TJSONClass; override;
     function GetAsValue: TValue; override;
     function GetAsArray: TJSONArray; override;
     function GetAsBoolean: Boolean; override;
@@ -223,7 +281,8 @@ type
     function GetAsObject: TJSONObject; override;
     function GetAsString: String; override;
   public
-    constructor Create(AValue: Extended);
+    constructor Create; override;
+    constructor CreateFrom(AValue: Extended);
     function IsEmpty: Boolean; override;
   end;
 
@@ -231,6 +290,7 @@ type
   private
     FValue: Boolean;
   protected
+    function GetClass: TJSONClass; override;
     function GetAsValue: TValue; override;
     function GetAsArray: TJSONArray; override;
     function GetAsBoolean: Boolean; override;
@@ -239,7 +299,8 @@ type
     function GetAsObject: TJSONObject; override;
     function GetAsString: String; override;
    public
-    constructor Create(AValue: Boolean);
+    constructor Create; override;
+    constructor CreateFrom(AValue: Boolean);
     function IsEmpty: Boolean; override;
   end;
 
@@ -251,6 +312,7 @@ type
     function GetItem(Index: Integer): TJSONValue;
     function GetName(Index: Integer): String;
   protected
+    function GetClass: TJSONClass; override;
     function GetAsArray: TJSONArray; override;
     function GetAsBoolean: Boolean; override;
     function GetAsFloat: Extended; override;
@@ -258,8 +320,10 @@ type
     function GetAsObject: TJSONObject; override;
     function GetAsString: String; override;
   public
-    constructor Create;
+    constructor Create; override;
+    constructor CreateFrom(AObject: TJSONObject);
     destructor Destroy; override;
+    function ToString: String; override;
     procedure Clear;
     procedure Delete(AKey: String);
     function IsEmpty: Boolean; override;
@@ -298,6 +362,7 @@ type
     function GetItem(Index: Integer): TJSONValue;
     function GetCount: Integer;
   protected
+    function GetClass: TJSONClass; override;
     function GetAsArray: TJSONArray; override;
     function GetAsBoolean: Boolean; override;
     function GetAsFloat: Extended; override;
@@ -306,7 +371,7 @@ type
     function GetAsString: String; override;
     procedure Add(AValue: TJSONValue); overload;
   public
-    constructor Create;
+    constructor Create; override;
     destructor Destroy; override;
     procedure Clear;
     procedure Add; overload;
@@ -334,7 +399,7 @@ function JsonGetValue(const AName: String; const ADefault: String; const AJSON: 
 implementation
 
 uses
-  Math, StrUtils, System.TypInfo;
+  System.Math, System.DateUtils, System.StrUtils, System.TypInfo;
 
 { Global }
 
@@ -351,6 +416,9 @@ resourcestring
   RCS_FIELD_VALUE_TYPE_MISMATCH = 'Field value type mismatch, declaration differs! (%s <> %s)';
   RCS_FIELD_COUNT_MISMATCH      = 'Fields and value count mismatch!';
   RCS_FIELD_NAME_ALREADY_EXISTS = 'A field with this name already exists!';
+  RCS_TEMPLATE_NAME_REQUIRED    = 'Error creating template "%s", nested name is required!';
+  RCS_TEMPLATE_NAME_NOT_FOUND   = 'Template with name "%s" not found!';
+  RCS_TEMPLATE_REQUIRED         = 'A template object is required!';
 
 resourcestring
   RCS_INVALID_JSON5_INVALID_IDENTIFIER = 'Invalid identifier found, unexpected character! (%s)';
@@ -362,8 +430,14 @@ type
   TJSONChars = set of TJSONChar;
   TJSON5Chars = set of TJSON5Char;
 
+const // Template type classification for internal handling of TJSONTemplate.Default and TJSONTemplate.Fill
+  JSON_ADVANCED_TEMPLATE_TYPES: set of TJSONTemplateType = [jttName, jttUnixTime, jttTemplate, jttCallback];
+  JSON_AUTOFILL_TEMPLATE_TYPES: set of TJSONTemplateType = [jttName, jttUnixTime, jttCallback];
+
 const
   JSON_TYPE_STRINGS: Array[TJSONType] of String = ('Null', 'Integer', 'Float', 'String', 'Boolean', 'Object', 'Array');
+  JSON_TYPE_TO_TEMPLATE_TYPE: Array[TJSONType] of TJSONTemplateType = (jttNull, jttInteger, jttFloat, jttString, jttBoolean, jttObject, jttArray);
+  JSON_TEMPLATE_TYPE_STRINGS: Array[TJSONTemplateType] of String = ('Null', 'Integer', 'Float', 'String', 'Boolean', 'Object', 'Array', '<Name>', '<UnixTime>', '<Template>', '<Callback>');
 
 const // Values
   JSON_NULL_VALUE  = 'null';
@@ -465,11 +539,15 @@ type
     procedure WriteBoolean(AValue: Boolean);
     procedure WriteObject(AValue: TJSONObject; AIdentLevel: Integer);
     procedure WriteArray(AValue: TJSONArray; AIdentLevel: Integer);
-    function InternalWrite(AJSON: TJSON): String;
+    function InternalWrite(AJSON: TJSON): String; overload; inline;
+    function InternalWrite(AJSON: TJSONObject): String; overload; inline;
+    function InternalWrite(AJSON: TJSONArray): String; overload; inline;
   public
     constructor Create(AWriteMode: TJSONStringWriteMode);
     destructor Destroy; override;
-    class function Write(AJSON: TJSON; AWriteMode: TJSONStringWriteMode): String;
+    class function Write(AJSON: TJSON; AWriteMode: TJSONStringWriteMode): String; overload;
+    class function Write(AJSONObject: TJSONObject; AWriteMode: TJSONStringWriteMode): String; overload;
+    class function Write(AJSONArray: TJSONArray; AWriteMode: TJSONStringWriteMode): String; overload;
   end;
 
   TJSONTemplatesList = class(THashedStringList)
@@ -719,7 +797,7 @@ begin
       end;
       '"': // String
       begin
-        Result:=TJSONString.Create(ParseString);
+        Result:=TJSONString.CreateFrom(ParseString);
         Break;
       end;
       '-', '0'..'9': // Numeric value
@@ -756,8 +834,8 @@ begin
         end;
 
         case Typ of
-          jtInteger: Result:=TJSONInteger.Create(StrToInt64Def(Value, 0));
-          jtFloat: Result:=TJSONFloat.Create(StrToFloatDef(Value, 0, TFormatSettings.Create(JSON_DEFAULT_LOCALE)));
+          jtInteger: Result:=TJSONInteger.CreateFrom(StrToInt64Def(Value, 0));
+          jtFloat: Result:=TJSONFloat.CreateFrom(StrToFloatDef(Value, 0, TFormatSettings.Create(JSON_DEFAULT_LOCALE)));
         end;
 
         Break;
@@ -775,7 +853,7 @@ begin
 
         if AnsiSameText(Value, JSON_TRUE_VALUE) then
         begin
-          Result:=TJSONBoolean.Create(True);
+          Result:=TJSONBoolean.CreateFrom(True);
         end else
         begin
           raise EJSONException.Create(RCS_INVALID_IDENTIFIER, FLineCount, FCharCount);
@@ -796,7 +874,7 @@ begin
 
         if AnsiSameText(Value, JSON_FALSE_VALUE) then
         begin
-          Result:=TJSONBoolean.Create(False);
+          Result:=TJSONBoolean.CreateFrom(False);
         end else
         begin
           raise EJSONException.Create(RCS_INVALID_IDENTIFIER, FLineCount, FCharCount);
@@ -1277,7 +1355,7 @@ begin
       end;
       '"', '''': // String
       begin
-        Result:=TJSONString.Create(ParseString);
+        Result:=TJSONString.CreateFrom(ParseString);
         Break;
       end;
       '.', '+', '-', '0'..'9': // Numeric value
@@ -1332,8 +1410,8 @@ begin
         end;
 
         case Typ of
-          jtInteger: Result:=TJSONInteger.Create(StrToInt64Def(Value, 0));
-          jtFloat: Result:=TJSONFloat.Create(StrToFloatDef(Value, 0, TFormatSettings.Create(JSON_DEFAULT_LOCALE)));
+          jtInteger: Result:=TJSONInteger.CreateFrom(StrToInt64Def(Value, 0));
+          jtFloat: Result:=TJSONFloat.CreateFrom(StrToFloatDef(Value, 0, TFormatSettings.Create(JSON_DEFAULT_LOCALE)));
         end;
 
         Break;
@@ -1351,7 +1429,7 @@ begin
 
         if AnsiSameText(Value, JSON_TRUE_VALUE) then
         begin
-          Result:=TJSONBoolean.Create(True);
+          Result:=TJSONBoolean.CreateFrom(True);
         end else
         begin
           raise EJSONException.Create(RCS_INVALID_IDENTIFIER, FLineCount, FCharCount);
@@ -1372,7 +1450,7 @@ begin
 
         if AnsiSameText(Value, JSON_FALSE_VALUE) then
         begin
-          Result:=TJSONBoolean.Create(False);
+          Result:=TJSONBoolean.CreateFrom(False);
         end else
         begin
           raise EJSONException.Create(RCS_INVALID_IDENTIFIER, FLineCount, FCharCount);
@@ -1438,18 +1516,32 @@ end;
 
 function TJSONWriter.InternalWrite(AJSON: TJSON): String;
 begin
+  Result:='';
+
   if NOT AJSON.IsEmpty then
   begin
     if AJSON.IsObject then
     begin
-      WriteObject(AJSON.AsObject, 0);
+      Result:=InternalWrite(AJSON.AsObject);
     end else
     if AJSON.IsArray then
     begin
-      WriteArray(AJSON.AsArray, 0);
+      Result:=InternalWrite(AJSON.AsArray);
     end;
   end;
+end;
 
+function TJSONWriter.InternalWrite(AJSON: TJSONObject): String;
+begin
+  FOutput.Clear;
+  WriteObject(AJSON.AsObject, 0);
+  Result:=FOutput.DataString;
+end;
+
+function TJSONWriter.InternalWrite(AJSON: TJSONArray): String;
+begin
+  FOutput.Clear;
+  WriteArray(AJSON.AsArray, 0);
   Result:=FOutput.DataString;
 end;
 
@@ -1460,6 +1552,30 @@ begin
   Writer:=TJSONWriter.Create(AWriteMode);
   try
     Result:=Writer.InternalWrite(AJSON);
+  finally
+    Writer.Free;
+  end;
+end;
+
+class function TJSONWriter.Write(AJSONArray: TJSONArray; AWriteMode: TJSONStringWriteMode): String;
+var
+  Writer: TJSONWriter;
+begin
+  Writer:=TJSONWriter.Create(AWriteMode);
+  try
+    Result:=Writer.InternalWrite(AJSONArray);
+  finally
+    Writer.Free;
+  end;
+end;
+
+class function TJSONWriter.Write(AJSONObject: TJSONObject; AWriteMode: TJSONStringWriteMode): String;
+var
+  Writer: TJSONWriter;
+begin
+  Writer:=TJSONWriter.Create(AWriteMode);
+  try
+    Result:=Writer.InternalWrite(AJSONObject);
   finally
     Writer.Free;
   end;
@@ -1632,7 +1748,7 @@ end;
 
 class function TJSON.CreateTemplate(AName: String): TJSONTemplate;
 begin
-  Result:=TJSONTemplate.Create;
+  Result:=TJSONTemplate.Create(AName);
   GlobTemplates.AddTemplates(AName, Result);
 end;
 
@@ -1833,17 +1949,8 @@ begin
 end;
 
 procedure TJSON.SaveToFile(const AFileName: String);
-var
-  OutStream: TStringStream;
 begin
-  OutStream:=TStringStream.Create('', TEncoding.ASCII);
-  try
-    OutStream.WriteString(WriteToString);
-    OutStream.Position:=0;
-    OutStream.SaveToFile(AFileName);
-  finally
-    FreeAndNil(OutStream);
-  end;
+  WriteToFile(AFileName);
 end;
 
 procedure TJSON.SaveToStream(AStream: TStream);
@@ -1875,6 +1982,20 @@ begin
   end;
 end;
 
+function TJSON.WriteToFile(const AFileName: String; AWriteMode: TJSONStringWriteMode = jswmReadable): String;
+var
+  OutStream: TStringStream;
+begin
+  OutStream:=TStringStream.Create('', TEncoding.ASCII);
+  try
+    OutStream.WriteString(WriteToString(AWriteMode));
+    OutStream.Position:=0;
+    OutStream.SaveToFile(AFileName);
+  finally
+    FreeAndNil(OutStream);
+  end;
+end;
+
 { TJSONValue }
 
 constructor TJSONValue.Create;
@@ -1882,9 +2003,20 @@ begin
   inherited Create;
 end;
 
+function TJSONValue.Copy: TJSONValue;
+begin
+  Result:=GetClass.Create;
+  AssignTo(Result);
+end;
+
 function TJSONValue.GetAsValue: TValue;
 begin
   Result:=TValue.Empty;
+end;
+
+function TJSONValue.GetClass: TJSONClass;
+begin
+  Result:=TJSONValue;
 end;
 
 function TJSONValue.GetIsArray: Boolean;
@@ -1940,6 +2072,29 @@ begin
     Result:=jtArray;
 end;
 
+procedure TJSONValue.AssignTo(Dest: TPersistent);
+var
+  I: Integer;
+begin
+  if (Dest IS TJSONValue) AND (GetTyp = TJSONValue(Dest).GetTyp) then
+  begin
+    if GetIsInteger then
+      TJSONInteger(Dest).FValue:=TJSONInteger(Self).FValue
+    else if GetIsFloat then
+      TJSONFloat(Dest).FValue:=TJSONFloat(Self).FValue
+    else if GetIsString then
+      TJSONString(Dest).FValue:=TJSONString(Self).FValue
+    else if GetIsBoolean then
+      TJSONBoolean(Dest).FValue:=TJSONBoolean(Self).FValue
+    else if GetIsObject then
+      for I:=0 to TJSONObject(Self).FKeys.Count - 1 do
+        TJSONObject(Dest).FKeys.AddObject(TJSONObject(Self).FKeys[I], TJSONValue(TJSONObject(Self).FKeys.Objects[I]).Copy)
+    else if GetIsArray then
+      for I:=0 to TJSONArray(Self).FValues.Count - 1 do
+        TJSONArray(Dest).FValues.Add(TJSONValue(TJSONArray(Self).FValues[I]).Copy);
+  end;
+end;
+
 { TJSONNull }
 
 constructor TJSONNull.Create;
@@ -1977,6 +2132,11 @@ begin
   Result:='';
 end;
 
+function TJSONNull.GetClass: TJSONClass;
+begin
+  Result:=TJSONNull;
+end;
+
 function TJSONNull.IsEmpty: Boolean;
 begin
   Result:=True;
@@ -1984,9 +2144,14 @@ end;
 
 { TJSONString }
 
-constructor TJSONString.Create(AValue: String);
+constructor TJSONString.Create;
 begin
   inherited Create;
+end;
+
+constructor TJSONString.CreateFrom(AValue: String);
+begin
+  Create;
 
   FValue:=AValue;
 end;
@@ -2026,6 +2191,11 @@ begin
   Result:=FValue;
 end;
 
+function TJSONString.GetClass: TJSONClass;
+begin
+  Result:=TJSONString;
+end;
+
 function TJSONString.IsEmpty: Boolean;
 begin
   Result:=FValue = '';
@@ -2033,9 +2203,14 @@ end;
 
 { TJSONInteger }
 
-constructor TJSONInteger.Create(AValue: Int64);
+constructor TJSONInteger.Create;
 begin
   inherited Create;
+end;
+
+constructor TJSONInteger.CreateFrom(AValue: Int64);
+begin
+  Create;
 
   FValue:=AValue;
 end;
@@ -2075,6 +2250,11 @@ begin
   Result:=FValue;
 end;
 
+function TJSONInteger.GetClass: TJSONClass;
+begin
+  Result:=TJSONInteger;
+end;
+
 function TJSONInteger.IsEmpty: Boolean;
 begin
   Result:=FValue = 0;
@@ -2082,9 +2262,14 @@ end;
 
 { TJSONFloat }
 
-constructor TJSONFloat.Create(AValue: Extended);
+constructor TJSONFloat.Create;
 begin
   inherited Create;
+end;
+
+constructor TJSONFloat.CreateFrom(AValue: Extended);
+begin
+  Create;
 
   FValue:=AValue;
 end;
@@ -2124,6 +2309,11 @@ begin
   Result:=FValue;
 end;
 
+function TJSONFloat.GetClass: TJSONClass;
+begin
+  Result:=TJSONFloat;
+end;
+
 function TJSONFloat.IsEmpty: Boolean;
 begin
   Result:=FValue = 0.0;
@@ -2131,9 +2321,14 @@ end;
 
 { TJSONBoolean }
 
-constructor TJSONBoolean.Create(AValue: Boolean);
+constructor TJSONBoolean.Create;
 begin
   inherited Create;
+end;
+
+constructor TJSONBoolean.CreateFrom(AValue: Boolean);
+begin
+  Create;
 
   FValue:=AValue;
 end;
@@ -2173,6 +2368,11 @@ begin
   Result:=FValue;
 end;
 
+function TJSONBoolean.GetClass: TJSONClass;
+begin
+  Result:=TJSONBoolean;
+end;
+
 function TJSONBoolean.IsEmpty: Boolean;
 begin
   Result:=NOT FValue;
@@ -2185,6 +2385,13 @@ begin
   inherited Create;
 
   FKeys:=THashedStringList.Create;
+end;
+
+constructor TJSONObject.CreateFrom(AObject: TJSONObject);
+begin
+  Create;
+
+  AObject.AssignTo(Self);
 end;
 
 destructor TJSONObject.Destroy;
@@ -2238,6 +2445,11 @@ end;
 function TJSONObject.GetAsString: String;
 begin
   Result:='';
+end;
+
+function TJSONObject.GetClass: TJSONClass;
+begin
+  Result:=TJSONObject;
 end;
 
 function TJSONObject.GetCount: Integer;
@@ -2405,7 +2617,7 @@ begin
     end else
     begin
       FKeys.Objects[Idx].Free;
-      FKeys.Objects[Idx]:=TJSONInteger.Create(AValue);
+      FKeys.Objects[Idx]:=TJSONInteger.CreateFrom(AValue);
     end;
   end else
   begin
@@ -2426,7 +2638,7 @@ begin
     end else
     begin
       FKeys.Objects[Idx].Free;
-      FKeys.Objects[Idx]:=TJSONString.Create(AValue);
+      FKeys.Objects[Idx]:=TJSONString.CreateFrom(AValue);
     end;
   end else
   begin
@@ -2447,7 +2659,7 @@ begin
     end else
     begin
       FKeys.Objects[Idx].Free;
-      FKeys.Objects[Idx]:=TJSONBoolean.Create(AValue);
+      FKeys.Objects[Idx]:=TJSONBoolean.CreateFrom(AValue);
     end;
   end else
   begin
@@ -2468,7 +2680,7 @@ begin
     end else
     begin
       FKeys.Objects[Idx].Free;
-      FKeys.Objects[Idx]:=TJSONFloat.Create(AValue);
+      FKeys.Objects[Idx]:=TJSONFloat.CreateFrom(AValue);
     end;
   end else
   begin
@@ -2491,6 +2703,11 @@ begin
   end;
 end;
 
+function TJSONObject.ToString: String;
+begin
+  Result:=TJSONWriter.Write(Self, jswmCondensed);
+end;
+
 procedure TJSONObject.Add(AKey: String; AValue: TJSONValue);
 begin
   FKeys.AddObject(AKey, AValue);
@@ -2503,17 +2720,17 @@ end;
 
 procedure TJSONObject.Add(AKey: String; AValue: Int64);
 begin
-  Add(AKey, TJSONInteger.Create(AValue));
+  Add(AKey, TJSONInteger.CreateFrom(AValue));
 end;
 
 procedure TJSONObject.Add(AKey, AValue: String);
 begin
-  Add(AKey, TJSONString.Create(AValue));
+  Add(AKey, TJSONString.CreateFrom(AValue));
 end;
 
 procedure TJSONObject.Add(AKey: String; AValue: Boolean);
 begin
-  Add(AKey, TJSONBoolean.Create(AValue));
+  Add(AKey, TJSONBoolean.CreateFrom(AValue));
 end;
 
 procedure TJSONObject.AddArray(AKey: String; AArray: TJSONArray);
@@ -2540,7 +2757,7 @@ end;
 
 procedure TJSONObject.Add(AKey: String; AValue: Extended);
 begin
-  Add(AKey, TJSONFloat.Create(AValue));
+  Add(AKey, TJSONFloat.CreateFrom(AValue));
 end;
 
 { TJSONArray }
@@ -2601,17 +2818,17 @@ end;
 
 procedure TJSONArray.Add(AValue: String);
 begin
-  Add(TJSONString.Create(AValue));
+  Add(TJSONString.CreateFrom(AValue));
 end;
 
 procedure TJSONArray.Add(AValue: Int64);
 begin
-  Add(TJSONInteger.Create(AValue));
+  Add(TJSONInteger.CreateFrom(AValue));
 end;
 
 procedure TJSONArray.Add(AValue: Boolean);
 begin
-  Add(TJSONBoolean.Create(AValue));
+  Add(TJSONBoolean.CreateFrom(AValue));
 end;
 
 procedure TJSONArray.AddArray(AArray: TJSONArray);
@@ -2647,7 +2864,7 @@ end;
 
 procedure TJSONArray.Add(AValue: Extended);
 begin
-  Add(TJSONFloat.Create(AValue));
+  Add(TJSONFloat.CreateFrom(AValue));
 end;
 
 function TJSONArray.GetAsArray: TJSONArray;
@@ -2678,6 +2895,11 @@ end;
 function TJSONArray.GetAsString: String;
 begin
   Result:='';
+end;
+
+function TJSONArray.GetClass: TJSONClass;
+begin
+  Result:=TJSONArray;
 end;
 
 function TJSONArray.GetCount: Integer;
@@ -2757,25 +2979,35 @@ end;
 
 { TJSONTemplate }
 
-constructor TJSONTemplate.Create;
+constructor TJSONTemplate.Create(AName: String);
 begin
   inherited Create;
 
+  FName:=AName;
   FJSON:=TJSON.CreateObjectRoot;
   FCritSec:=TCriticalSection.Create;
+  FLastAdded:=-1;
 
-  SetLength(FValues, 0)
+  SetLength(FValues, 0);
 end;
 
 destructor TJSONTemplate.Destroy;
 begin
+  Cleanup;
+
   FreeAndNil(FJSON);
   FreeAndNil(FCritSec);
 
   inherited;
 end;
 
-function TJSONTemplate.Default: TJSON;
+procedure TJSONTemplate.DoTemplateFillCallback(ATemplateName, AKeyName: String; var AValue: TJSONValue);
+begin
+  if Assigned(FOnTemplateFillCallback) then
+    FOnTemplateFillCallback(ATemplateName, AKeyName, AValue);
+end;
+
+function TJSONTemplate.Empty(AUseDefaults: Boolean = True): TJSON;
 var
   I: Integer;
   V: TJSONValue;
@@ -2788,24 +3020,41 @@ begin
       begin
         V:=nil;
 
-        case FValues[I].JSONType of
-          jtNull: V:=TJSONNull.Create;
-          jtInteger: V:=TJSONInteger.Create(0);
-          jtFloat: V:=TJSONFloat.Create(0.0);
-          jtString: V:=TJSONString.Create('');
-          jtBoolean: V:=TJSONBoolean.Create(False);
-          jtObject: V:=TJSONObject.Create;
-          jtArray: V:=TJSONArray.Create;
+        if ((tfOmitEmpty IN FFlags) AND NOT (AUseDefaults AND Assigned(FValues[I].Default))) AND NOT (FValues[I].Typ IN JSON_ADVANCED_TEMPLATE_TYPES) then
+        begin
+          Continue;
+        end else
+        begin
+          if AUseDefaults AND Assigned(FValues[I].Default) then
+          begin
+            V:=FValues[I].Default.Copy;
+          end else
+          case FValues[I].Typ of
+            jttNull: V:=TJSONNull.Create;
+            jttInteger: V:=TJSONInteger.CreateFrom(0);
+            jttFloat: V:=TJSONFloat.CreateFrom(0.0);
+            jttString: V:=TJSONString.CreateFrom('');
+            jttBoolean: V:=TJSONBoolean.CreateFrom(False);
+            jttObject: V:=TJSONObject.Create;
+            jttArray: V:=TJSONArray.Create;
+          end;
         end;
 
         if Assigned(V) then
         begin
-          if V.Typ = FValues[I].JSONType then
+          if (JSON_TYPE_TO_TEMPLATE_TYPE[V.Typ] = FValues[I].Typ) then
             FJSON.AsObject.Add(FValues[I].Name, V)
           else
-            raise Exception.Create(Format(RCS_FIELD_VALUE_TYPE_MISMATCH, [JSON_TYPE_STRINGS[FValues[I].JSONType], JSON_TYPE_STRINGS[V.Typ]]));
+            raise Exception.Create(Format(RCS_FIELD_VALUE_TYPE_MISMATCH, [JSON_TEMPLATE_TYPE_STRINGS[FValues[I].Typ], JSON_TYPE_STRINGS[V.Typ]]));
         end else
-          FJSON.AsObject.Add(FValues[I].Name, TJSONNull.Create);
+        begin
+          case FValues[I].Typ of
+            jttName: FJSON.AsObject.Add(FValues[I].Name, TJSONString.CreateFrom(FName));
+            jttUnixTime: FJSON.AsObject.Add(FValues[I].Name, TJSONInteger.CreateFrom(DateTimeToUnix(Now)));
+            jttTemplate: FJSON.AsObject.Add(FValues[I].Name, TJSONObject.CreateFrom(FValues[I].Nested.Empty.AsObject));
+            else FJSON.AsObject.Add(FValues[I].Name, TJSONNull.Create);
+          end;
+        end;
       end;
     finally
       Result:=FJSON;
@@ -2815,7 +3064,7 @@ begin
   end;
 end;
 
-function TJSONTemplate.Add(AName: String; AType: TJSONType): TJSONTemplate;
+function TJSONTemplate.Add(AName: String; AType: TJSONTemplateType; ATemplate: TJSONTemplate; ACallback: TJSONTemplateFillCallback): TJSONTemplate;
 var
   I: Integer;
 begin
@@ -2824,21 +3073,79 @@ begin
   FCritSec.Enter;
   try
     SetLength(FValues, Length(FValues) + 1);
+    FLastAdded:=High(FValues);
 
     for I:=Low(FValues) to High(FValues) do
       if SameText(AName, FValues[I].Name) then
          raise Exception.Create(RCS_FIELD_NAME_ALREADY_EXISTS);
 
     FValues[High(FValues)].Name:=AName;
-    FValues[High(FValues)].JSONType:=AType;
+    FValues[High(FValues)].Typ:=AType;
+    FValues[High(FValues)].Nested:=ATemplate;
+    FValues[High(FValues)].Callback:=ACallback;
   finally
     FCritSec.Leave;
   end;
 end;
 
-function TJSONTemplate.Add(AField: TJSONField): TJSONTemplate;
+function TJSONTemplate.Add(AName: String; AType: TJSONType): TJSONTemplate;
 begin
-  Result:=Add(AField.Name, AField.Typ);
+  Result:=Add(AName, JSON_TYPE_TO_TEMPLATE_TYPE[AType], nil, nil);
+end;
+
+function TJSONTemplate.Add(AName: String; AType: TJSONTemplateType): TJSONTemplate;
+begin
+  Result:=Add(AName, AType, nil, nil);
+end;
+
+function TJSONTemplate.Add(AName: String; ATemplate: TJSONTemplate): TJSONTemplate;
+begin
+  if Assigned(ATemplate) then
+    Result:=Add(AName, jttTemplate, ATemplate, nil)
+  else
+    raise Exception.Create(RCS_TEMPLATE_REQUIRED);
+end;
+
+function TJSONTemplate.Add(AName: String; ATemplateName: String): TJSONTemplate;
+begin
+  if Length(Trim(ATemplateName)) = 0 then
+    raise Exception.Create(Format(RCS_TEMPLATE_NAME_REQUIRED, [AName]));
+
+  if NOT Assigned(TJSON.Template(ATemplateName)) then
+    raise Exception.Create(Format(RCS_TEMPLATE_NAME_NOT_FOUND, [ATemplateName]));
+
+  Result:=Add(AName, jttTemplate, TJSON.Template(ATemplateName), nil);
+end;
+
+function TJSONTemplate.Add(AName: String; ACallback: TJSONTemplateFillCallback): TJSONTemplate;
+begin
+  Result:=Add(AName, jttCallback, nil, ACallback);
+end;
+
+function TJSONTemplate.Add(AField: TJSONTemplateField): TJSONTemplate;
+begin
+  Result:=Add(AField.Name, AField.Typ, AField.Nested, AField.Callback);
+end;
+
+function TJSONTemplate.Default(AValue: TJSONValue): TJSONTemplate;
+begin
+  Result:=Self;
+
+  if FLastAdded >= 0 then
+  begin
+    if Assigned(FValues[FLastAdded].Default) then
+      FValues[FLastAdded].Default.Free;
+    FValues[FLastAdded].Default:=AValue;
+  end;
+end;
+
+procedure TJSONTemplate.Cleanup;
+var
+  I: Integer;
+begin
+  for I:=Low(FValues) to High(FValues) do
+    if Assigned(FValues[I].Default) then
+      FreeAndNil(FValues[I].Default);
 end;
 
 procedure TJSONTemplate.Clear;
@@ -2848,49 +3155,80 @@ end;
 
 function TJSONTemplate.Fill(AValues: Array of const): TJSON;
 var
-  I: Integer;
+  I, Skipped: Integer;
   V: TJSONValue;
 begin
   FCritSec.Enter;
   try
     FJSON.RootNewObject;
     try
-      if Length(FValues) <> Length(AValues) then
+      if GetTemplateFieldCount <> Length(AValues) then
         raise Exception.Create(RCS_FIELD_COUNT_MISMATCH);
 
-      for I:=Low(AValues) to High(AValues) do
+      Skipped:=0;
+      for I:=Low(FValues) to High(FValues) do
       begin
         V:=nil;
 
-        case AValues[I].VType of
-          vtInteger: V:=TJSONInteger.Create(AValues[I].VInteger);
-          vtBoolean: V:=TJSONBoolean.Create(AValues[I].VBoolean);
-          vtChar: V:=TJSONString.Create(String(AValues[I].VChar));
-          vtExtended: V:=TJSONFloat.Create(AValues[I].VExtended^);
-          vtString: V:=TJSONString.Create(String(AValues[I].VString^));
-          vtPointer: V:=TJSONNull.Create;
-          vtPChar: V:=TJSONString.Create(String(AnsiString(AValues[I].VPChar^)));
-          vtObject: V:=TJSONNull.Create;
+        if FValues[I].Typ IN JSON_AUTOFILL_TEMPLATE_TYPES then
+        begin
+          Inc(Skipped);
+
+          if FValues[I].Typ = jttCallback then
+          begin
+            if Assigned(FValues[I].Callback) then
+              FValues[I].Callback(FName, FValues[I].Name, V)
+            else
+              DoTemplateFillCallback(FName, FValues[I].Name, V);
+          end;
+        end else
+        case AValues[I - Skipped].VType of
+          vtInteger: V:=TJSONInteger.CreateFrom(AValues[I - Skipped].VInteger);
+          vtBoolean: V:=TJSONBoolean.CreateFrom(AValues[I - Skipped].VBoolean);
+          vtChar: V:=TJSONString.CreateFrom(String(AValues[I - Skipped].VChar));
+          vtExtended: V:=TJSONFloat.CreateFrom(AValues[I - Skipped].VExtended^);
+          vtString: V:=TJSONString.CreateFrom(String(AValues[I - Skipped].VString^));
+          vtPointer:
+          begin
+            if Assigned(AValues[I - Skipped].VPointer) then
+              V:=TJSONNull.Create;
+          end;
+          vtPChar: V:=TJSONString.CreateFrom(String(AnsiString(AValues[I - Skipped].VPChar^)));
+          vtObject:
+          begin
+            if Assigned(AValues[I - Skipped].VObject) AND (AValues[I - Skipped].VObject IS TJSON) AND (TJSON(AValues[I - Skipped].VObject).IsObject) then
+              V:=TJSONObject.CreateFrom(TJSON(AValues[I - Skipped].VObject).AsObject)
+            else
+              V:=TJSONNull.Create;
+          end;
           vtClass: V:=TJSONNull.Create;
-          vtWideChar: V:=TJSONString.Create(AValues[I].VWideChar);
-          vtPWideChar: V:=TJSONString.Create(String(AValues[I].VPWideChar));
-          vtAnsiString: V:=TJSONString.Create(String(AnsiString(AValues[I].VAnsiString)));
-          vtCurrency: V:=TJSONFloat.Create(AValues[I].VCurrency^);
+          vtWideChar: V:=TJSONString.CreateFrom(AValues[I - Skipped].VWideChar);
+          vtPWideChar: V:=TJSONString.CreateFrom(String(AValues[I - Skipped].VPWideChar));
+          vtAnsiString: V:=TJSONString.CreateFrom(String(AnsiString(AValues[I - Skipped].VAnsiString)));
+          vtCurrency: V:=TJSONFloat.CreateFrom(AValues[I - Skipped].VCurrency^);
           vtVariant: V:=TJSONNull.Create;
           vtInterface: V:=TJSONNull.Create;
-          vtWideString: V:=TJSONString.Create(String(PWideChar(AValues[I].VWideString)));
-          vtInt64: V:=TJSONInteger.Create(AValues[I].VInt64^);
-          vtUnicodeString: V:=TJSONString.Create(String(AValues[I].VUnicodeString));
+          vtWideString: V:=TJSONString.CreateFrom(String(PWideChar(AValues[I - Skipped].VWideString)));
+          vtInt64: V:=TJSONInteger.CreateFrom(AValues[I - Skipped].VInt64^);
+          vtUnicodeString: V:=TJSONString.CreateFrom(String(AValues[I - Skipped].VUnicodeString));
         end;
 
         if Assigned(V) then
         begin
-          if (V.Typ = FValues[I].JSONType) OR (V.Typ = jtNull) then
+          if (JSON_TYPE_TO_TEMPLATE_TYPE[V.Typ] = FValues[I].Typ) OR (V.Typ = jtNull) OR (FValues[I].Typ IN [jttTemplate, jttCallback]) then
             FJSON.AsObject.Add(FValues[I].Name, V)
           else
-            raise Exception.Create(Format(RCS_FIELD_VALUE_TYPE_MISMATCH, [JSON_TYPE_STRINGS[FValues[I].JSONType], JSON_TYPE_STRINGS[V.Typ]]));
+            raise Exception.Create(Format(RCS_FIELD_VALUE_TYPE_MISMATCH, [JSON_TEMPLATE_TYPE_STRINGS[FValues[I].Typ], JSON_TYPE_STRINGS[V.Typ]]));
         end else
-          FJSON.AsObject.Add(FValues[I].Name, TJSONNull.Create);
+        begin
+          if NOT (tfOmitEmpty IN FFlags) then
+          case FValues[I].Typ of
+            jttName: FJSON.AsObject.Add(FValues[I].Name, TJSONString.CreateFrom(FName));
+            jttUnixTime: FJSON.AsObject.Add(FValues[I].Name, TJSONInteger.CreateFrom(DateTimeToUnix(Now)));
+            jttTemplate: FJSON.AsObject.Add(FValues[I].Name, TJSONObject.CreateFrom(FValues[I].Nested.Empty.AsObject));
+            else FJSON.AsObject.Add(FValues[I].Name, TJSONNull.Create);
+          end;
+        end;
       end;
     finally
       Result:=FJSON;
@@ -2898,6 +3236,31 @@ begin
   finally
     FCritSec.Leave;
   end;
+end;
+
+function TJSONTemplate.SetFlag(AFlag: TJSONTemplateFlag): TJSONTemplate;
+begin
+  Result:=Self;
+
+  FFlags:=FFlags + [AFlag];
+end;
+
+function TJSONTemplate.GetTemplateFieldCount: Integer;
+var
+  I: Integer;
+begin
+  Result:=0;
+
+  for I:=Low(FValues) to High(FValues) do
+    if NOT (FValues[I].Typ IN JSON_AUTOFILL_TEMPLATE_TYPES) then
+      Inc(Result);
+end;
+
+function TJSONTemplate.SetFlags(AFlags: TJSONTemplateFlags): TJSONTemplate;
+begin
+  Result:=Self;
+
+  FFlags:=AFlags;
 end;
 
 function TJSONTemplate.SetValue(AName: String; const AValue: Variant): Boolean;
@@ -2915,18 +3278,18 @@ begin
     varWord,
     varLongWord,
     varInt64,
-    varUInt64: V:=TJSONInteger.Create(AValue);
+    varUInt64: V:=TJSONInteger.CreateFrom(AValue);
 
     varSingle,
     varDouble,
     varCurrency,
-    varDate: V:=TJSONFloat.Create(AValue);
+    varDate: V:=TJSONFloat.CreateFrom(AValue);
 
-    varBoolean: V:=TJSONBoolean.Create(AValue);
+    varBoolean: V:=TJSONBoolean.CreateFrom(AValue);
 
     varOleStr,
     varString,
-    varUString: V:=TJSONString.Create(AValue);
+    varUString: V:=TJSONString.CreateFrom(AValue);
 
     else
       V:=TJSONNull.Create;
@@ -2934,7 +3297,7 @@ begin
 
   for I:=0 to High(FValues) do
   begin
-    if AnsiSameText(FValues[I].Name, AName) AND (FValues[I].JSONType = V.Typ) then
+    if AnsiSameText(FValues[I].Name, AName) AND (FValues[I].Typ = JSON_TYPE_TO_TEMPLATE_TYPE[V.Typ]) then
     begin
       FJSON.AsObject.SetOrAdd(AName, V);
       Result:=True;
@@ -2950,4 +3313,3 @@ finalization
   FreeAndNil(GlobTemplates);
 
 end.
-

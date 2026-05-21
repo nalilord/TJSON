@@ -2,14 +2,27 @@
 (*                                                                            *)
 (*  Delphi JSON Parser Class                                                  *)
 (*                                                                            *)
-(*  Version     : 1.07 (2025-03-24)                                           *)
+(*  Version     : 1.08 (2026-05-05)                                           *)
 (*  License     : GPL v3.0                                                    *)
 (*  Author      : NaliLord / DMA (Daniel M.)                                  *)
 (*                                                                            *)
-(*  Copyright (c) 2025                                                        *)
+(*  Copyright (c) 2026                                                        *)
 (*                                                                            *)
 (*  History:                                                                  *)
 (*  ========================================================================  *)
+(*                                                                            *)
+(*  - 1.08 [2026-05-05] DMA: Bug fixes and feature additions                  *)
+(*    Fix: JSON5 multiline string continuation now correctly consumes \<LF>   *)
+(*    Fix: JSON5 arrays now support // and /* */ comments                     *)
+(*    Fix: TJSONTemplate.Fill now handles vtDynArray (creates empty array)    *)
+(*    Fix: All output streams changed to UTF-8; EncodeString escapes $80-$FF  *)
+(*    New: JSON5 block comments (/* ... */)                                   *)
+(*    New: JSON5 Infinity, -Infinity, NaN, +Infinity values                   *)
+(*    New: JSON5 \xNN hex escape sequences in strings                         *)
+(*    New: TJSONObject.Path(dotted.key.path) for deep access                  *)
+(*    New: TJSONObject.Merge(ASource) for deep object merging                 *)
+(*    New: TJSONArray.ToString (condensed output, matches TJSONObject)        *)
+(*    New: TJSONObject.Add raises on duplicate keys                           *)
 (*                                                                            *)
 (*  - 1.07 [2025-03-24] DMA: Updated the Template System                      *)
 (*    Renamed "Default" to "Empty"                                            *)
@@ -159,6 +172,7 @@ type
     function IsEmpty: Boolean; virtual;
     function WriteToString(AWriteMode: TJSONStringWriteMode = jswmReadable): String; virtual;
     function WriteToFile(const AFileName: String; AWriteMode: TJSONStringWriteMode = jswmReadable): String; virtual;
+    function Path(const APath: String): TJSONValue;
     function RootNewArray: TJSONArray;
     function RootNewObject: TJSONObject;
     procedure Assign(ASource: TPersistent); override;
@@ -350,6 +364,8 @@ type
     function GetOrAddObject(AKey: String): TJSONObject;
     function GetOrAddArray(AKey: String): TJSONArray; overload;
     function GetOrAddArray<T>(AKey: String; ADefault: TArray<T>): TArray<T>; overload;
+    function Path(const APath: String): TJSONValue;
+    procedure Merge(ASource: TJSONObject);
     property Count: Integer                   read GetCount;
     property Value[Key: String]: TJSONValue   read GetValue; default;
     property Item[Index: Integer]: TJSONValue read GetItem;
@@ -390,6 +406,7 @@ type
     function AddObject: TJSONObject; overload;
     function AddObject(AKey: String; AValue: TJSONValue): TJSONObject; overload;
     function AddArray: TJSONArray; overload;
+    function ToString: String; override;
     property Count: Integer                   read GetCount;
     property Item[Index: Integer]: TJSONValue read GetItem; default;
   end;
@@ -416,6 +433,7 @@ resourcestring
   RCS_FIELD_VALUE_TYPE_MISMATCH = 'Field value type mismatch, declaration differs! (%s <> %s)';
   RCS_FIELD_COUNT_MISMATCH      = 'Fields and value count mismatch!';
   RCS_FIELD_NAME_ALREADY_EXISTS = 'A field with this name already exists!';
+  RCS_DUPLICATE_KEY             = 'Duplicate key "%s" in JSON object!';
   RCS_TEMPLATE_NAME_REQUIRED    = 'Error creating template "%s", nested name is required!';
   RCS_TEMPLATE_NAME_NOT_FOUND   = 'Template with name "%s" not found!';
   RCS_TEMPLATE_REQUIRED         = 'A template object is required!';
@@ -423,6 +441,7 @@ resourcestring
 resourcestring
   RCS_INVALID_JSON5_INVALID_IDENTIFIER = 'Invalid identifier found, unexpected character! (%s)';
   RCS_INVALID_JSON5_MULTILINE_STRING   = 'Invalid multiline string found!';
+  RCS_INVALID_JSON5_BLOCK_COMMENT      = 'Unterminated block comment!';
 
 type
   TJSONChar = (jcLeftBrace, jcRightBrace, jcColon, jcComma, jcLeftBracket, jcRightBracket, jcDoubleQuote);
@@ -441,6 +460,7 @@ const
 
 const // Values
   JSON_NULL_VALUE  = 'null';
+  JSON_NAN_VALUE   = 'NaN';
   JSON_FALSE_VALUE = 'false';
   JSON_TRUE_VALUE  = 'true';
 
@@ -514,6 +534,7 @@ type
     procedure ExpectNext(AChar: TJSON5Char); inline;
     procedure IsExpected; inline;
   protected
+    procedure SkipBlockComment;
     procedure ParseArray(AArr: TJSONArray); override;
     procedure ParseObject(AObj: TJSONObject); override;
     function ParseString: String; override;
@@ -989,6 +1010,34 @@ end;
 
 { TJSON5Parser }
 
+procedure TJSON5Parser.SkipBlockComment;
+begin
+  while HasData do
+  begin
+    Next;
+
+    case FBuffer of
+      '*':
+      begin
+        if HasData then
+        begin
+          Next;
+          if FBuffer = '/' then
+            Exit;
+          Rollback;
+        end;
+      end;
+      #10:
+      begin
+        Inc(FLineCount);
+        FCharCount:=0;
+      end;
+    end;
+  end;
+
+  raise EJSONException.Create(RCS_INVALID_JSON5_BLOCK_COMMENT, FLineCount, FCharCount);
+end;
+
 procedure TJSON5Parser.Expect(AChars: TJSON5Chars);
 begin
   FNextExpected:=AChars;
@@ -1093,7 +1142,10 @@ begin
 end;
 
 procedure TJSON5Parser.ParseArray(AArr: TJSONArray);
+var
+  IsComment: Boolean;
 begin
+  IsComment:=False;
   Expect([jc5RightBracket]);
 
   while HasData do
@@ -1103,11 +1155,29 @@ begin
     case FBuffer of
       ']':
       begin
+        if IsComment then Continue;
         IsExpected;
         Break;
       end;
+      '/':
+      begin
+        if IsComment then Continue;
+        if HasData then
+        begin
+          Next;
+          if FBuffer = '/' then
+            IsComment:=True
+          else if FBuffer = '*' then
+          begin
+            SkipBlockComment;
+            Expect([jc5RightBracket]);
+          end else
+            raise EJSONException.Create(Format(RCS_INVALID_CHARACTER, [FBuffer]), FLineCount, FCharCount);
+        end;
+      end;
       ',':
       begin
+        if IsComment then Continue;
         IsExpected;
         Expect([jc5RightBracket]);
         Continue;
@@ -1116,6 +1186,7 @@ begin
       begin
         Inc(FLineCount);
         FCharCount:=0;
+        IsComment:=False;
         Continue;
       end;
       #9, #13, #32:
@@ -1124,6 +1195,7 @@ begin
       end;
       else
       begin
+        if IsComment then Continue;
         Rollback;
         AArr.Add(ParseValue);
         Expect([jc5Comma, jc5RightBracket]);
@@ -1171,11 +1243,21 @@ begin
     Next;
 
     case FBuffer of
-      '/': // Comment
+      '/': // Comment (// line comment or /* block comment */)
       begin
         IsExpected;
-        ExpectNext(jc5Comment);
-        IsComment:=True;
+        if HasData then
+        begin
+          Next;
+          if FBuffer = '/' then
+            IsComment:=True
+          else if FBuffer = '*' then
+          begin
+            SkipBlockComment;
+            Expect([jc5DoubleQuote, jc5SingleQuote, jc5RightBrace, jc5Comment, jc5Identifier]);
+          end else
+            raise EJSONException.Create(Format(RCS_INVALID_CHARACTER, [FBuffer]), FLineCount, FCharCount);
+        end;
       end;
       '"', '''': // Key string
       begin
@@ -1202,7 +1284,7 @@ begin
       begin
         if IsComment then Continue;
         IsExpected;
-        Expect([jc5DoubleQuote, jc5Identifier, jc5RightBrace]);
+        Expect([jc5DoubleQuote, jc5SingleQuote, jc5Identifier, jc5RightBrace, jc5Comment]);
         Continue;
       end;
       '}': // End of object
@@ -1271,17 +1353,37 @@ begin
             't': Result:=Result + #9;
             #10, #13:
             begin
+              // Line continuation: backslash-newline is consumed, nothing appended
               if FBuffer = #13 then
               begin
                 Next;
-                if HasData AND (FBuffer = #10) then
-                  Result:=Result + #13#10
-                else
+                if NOT (HasData AND (FBuffer = #10)) then
                   raise EJSONException.Create(RCS_INVALID_JSON5_MULTILINE_STRING, FLineCount, FCharCount);
-              end else
-                Result:=Result + Char(FBuffer);
+              end;
 
               Inc(FLineCount);
+              FCharCount:=0;
+            end;
+            'x':
+            begin
+              Unicode:='';
+
+              for I:=0 to 1 do
+              begin
+                if HasData then
+                begin
+                  Next;
+                  Unicode:=Unicode + Char(FBuffer);
+                end;
+              end;
+
+              if Length(Unicode) = 2 then
+              begin
+                Result:=Result + Char(StrToIntDef('$' + Unicode, 63));
+              end else
+              begin
+                raise EJSONException.Create(RCS_INVALID_ESCAPE_CHARACTER, FLineCount, FCharCount);
+              end;
             end;
             'u':
             begin
@@ -1330,6 +1432,7 @@ var
   Typ: TJSONType;
   Obj: TJSONObject;
   Arr: TJSONArray;
+  IsNeg: Boolean;
 begin
   Result:=nil;
   Value:='';
@@ -1358,10 +1461,56 @@ begin
         Result:=TJSONString.CreateFrom(ParseString);
         Break;
       end;
-      '.', '+', '-', '0'..'9': // Numeric value
+      'I': // Infinity
       begin
         Value:=Char(FBuffer);
+
+        for I:=1 to Length('Infinity') - 1 do
+        begin
+          if HasData then Next else Break;
+          Value:=Value + Char(FBuffer);
+        end;
+
+        if AnsiSameText(Value, 'Infinity') then
+          Result:=TJSONFloat.CreateFrom(Infinity)
+        else
+          raise EJSONException.Create(RCS_INVALID_IDENTIFIER, FLineCount, FCharCount);
+
+        Break;
+      end;
+      '.', '+', '-', '0'..'9': // Numeric value (includes +/-Infinity)
+      begin
+        IsNeg:=(FBuffer = '-');
+        Value:=Char(FBuffer);
         Typ:=jtInteger;
+
+        // Handle sign prefix: check for [+-]Infinity
+        if (FBuffer = '+') OR (FBuffer = '-') then
+        begin
+          if HasData then
+          begin
+            Next;
+            if FBuffer = 'I' then
+            begin
+              Value:=Char(FBuffer); // 'I'
+              for I:=1 to Length('Infinity') - 1 do
+              begin
+                if HasData then Next else Break;
+                Value:=Value + Char(FBuffer);
+              end;
+              if AnsiSameText(Value, 'Infinity') then
+              begin
+                if IsNeg then
+                  Result:=TJSONFloat.CreateFrom(NegInfinity)
+                else
+                  Result:=TJSONFloat.CreateFrom(Infinity);
+              end else
+                raise EJSONException.Create(RCS_INVALID_IDENTIFIER, FLineCount, FCharCount);
+              Break;
+            end else
+              Value:=Value + Char(FBuffer); // sign + first digit/dot
+          end;
+        end;
 
         while HasData do
         begin
@@ -1409,10 +1558,11 @@ begin
           end;
         end;
 
-        case Typ of
-          jtInteger: Result:=TJSONInteger.CreateFrom(StrToInt64Def(Value, 0));
-          jtFloat: Result:=TJSONFloat.CreateFrom(StrToFloatDef(Value, 0, TFormatSettings.Create(JSON_DEFAULT_LOCALE)));
-        end;
+        if Result = nil then
+          case Typ of
+            jtInteger: Result:=TJSONInteger.CreateFrom(StrToInt64Def(Value, 0));
+            jtFloat: Result:=TJSONFloat.CreateFrom(StrToFloatDef(Value, 0, TFormatSettings.Create(JSON_DEFAULT_LOCALE)));
+          end;
 
         Break;
       end;
@@ -1458,24 +1608,28 @@ begin
 
         Break;
       end;
-      'n', 'N': // Null
+      'n', 'N': // null or NaN
       begin
         Value:=Char(FBuffer);
 
-        for I:=0 to Length(JSON_NULL_VALUE) - 2 do
+        while HasData do
         begin
           Next;
-
-          Value:=Value + Char(FBuffer);
+          if CharInSet(FBuffer, ['a'..'z', 'A'..'Z']) then
+            Value:=Value + Char(FBuffer)
+          else
+          begin
+            Rollback;
+            Break;
+          end;
         end;
 
         if AnsiSameText(Value, JSON_NULL_VALUE) then
-        begin
-          Result:=TJSONNull.Create;
-        end else
-        begin
+          Result:=TJSONNull.Create
+        else if AnsiSameText(Value, JSON_NAN_VALUE) then
+          Result:=TJSONFloat.CreateFrom(NaN)
+        else
           raise EJSONException.Create(RCS_INVALID_IDENTIFIER, FLineCount, FCharCount);
-        end;
 
         Break;
       end;
@@ -1504,7 +1658,7 @@ begin
   inherited Create;
 
   FWriteMode:=AWriteMode;
-  FOutput:=TStringStream.Create('', TEncoding.ASCII, False);
+  FOutput:=TStringStream.Create('', TEncoding.UTF8, False);
 end;
 
 destructor TJSONWriter.Destroy;
@@ -1734,7 +1888,7 @@ begin
       $22: Result:=Result + '\"';
       $2F: Result:=Result + '\/';
       $5C: Result:=Result + '\\';
-      $100..$FFFF:
+      $80..$FFFF:
       begin
         Result:=Result + '\u' + AnsiLowerCase(IntToHex(Ord(AString[I]), 4));
       end
@@ -1757,7 +1911,7 @@ begin
   inherited Create;
 
   FCritSec:=TCriticalSection.Create;
-  FData:=TStringStream.Create(EmptyStr, TEncoding.ASCII, False);
+  FData:=TStringStream.Create(EmptyStr, TEncoding.UTF8, False);
 end;
 
 constructor TJSON.CreateArrayRoot;
@@ -1957,7 +2111,7 @@ procedure TJSON.SaveToStream(AStream: TStream);
 var
   OutStream: TStringStream;
 begin
-  OutStream:=TStringStream.Create('', TEncoding.ASCII);
+  OutStream:=TStringStream.Create('', TEncoding.UTF8);
   try
     OutStream.WriteString(WriteToString);
     OutStream.Position:=0;
@@ -1965,6 +2119,13 @@ begin
   finally
     FreeAndNil(OutStream);
   end;
+end;
+
+function TJSON.Path(const APath: String): TJSONValue;
+begin
+  Result:=nil;
+  if IsObject then
+    Result:=AsObject.Path(APath);
 end;
 
 class function TJSON.Template(AName: String): TJSONTemplate;
@@ -1986,7 +2147,7 @@ function TJSON.WriteToFile(const AFileName: String; AWriteMode: TJSONStringWrite
 var
   OutStream: TStringStream;
 begin
-  OutStream:=TStringStream.Create('', TEncoding.ASCII);
+  OutStream:=TStringStream.Create('', TEncoding.UTF8);
   try
     OutStream.WriteString(WriteToString(AWriteMode));
     OutStream.Position:=0;
@@ -2708,8 +2869,60 @@ begin
   Result:=TJSONWriter.Write(Self, jswmCondensed);
 end;
 
+function TJSONObject.Path(const APath: String): TJSONValue;
+var
+  Parts: TArray<String>;
+  Part: String;
+  Current: TJSONValue;
+  Idx: Integer;
+begin
+  Result:=nil;
+  Parts:=APath.Split(['.']);
+  Current:=Self;
+
+  for Part in Parts do
+  begin
+    if Current = nil then
+      Exit;
+    if Current IS TJSONObject then
+      Current:=TJSONObject(Current).GetValue(Part)
+    else if Current IS TJSONArray then
+    begin
+      if TryStrToInt(Part, Idx) then
+        Current:=TJSONArray(Current).GetItem(Idx)
+      else
+        Exit;
+    end else
+      Exit;
+  end;
+
+  Result:=Current;
+end;
+
+procedure TJSONObject.Merge(ASource: TJSONObject);
+var
+  I: Integer;
+  SrcVal, DstVal: TJSONValue;
+begin
+  if NOT Assigned(ASource) then
+    Exit;
+
+  for I:=0 to ASource.Count - 1 do
+  begin
+    SrcVal:=ASource.Item[I];
+    DstVal:=GetValue(ASource.Name[I]);
+
+    if Assigned(DstVal) AND (DstVal IS TJSONObject) AND (SrcVal IS TJSONObject) then
+      TJSONObject(DstVal).Merge(TJSONObject(SrcVal))
+    else
+      SetOrAdd(ASource.Name[I], SrcVal.Copy);
+  end;
+end;
+
 procedure TJSONObject.Add(AKey: String; AValue: TJSONValue);
 begin
+  if FKeys.IndexOf(AKey) >= 0 then
+    raise Exception.Create(Format(RCS_DUPLICATE_KEY, [AKey]));
   FKeys.AddObject(AKey, AValue);
 end;
 
@@ -2928,6 +3141,11 @@ end;
 function TJSONArray.IsEmpty: Boolean;
 begin
   Result:=FValues.Count = 0;
+end;
+
+function TJSONArray.ToString: String;
+begin
+  Result:=TJSONWriter.Write(Self, jswmCondensed);
 end;
 
 procedure TJSONArray.Move(ACurIndex, ANewIndex: Integer);
@@ -3196,10 +3414,26 @@ begin
           vtPChar: V:=TJSONString.CreateFrom(String(AnsiString(AValues[I - Skipped].VPChar^)));
           vtObject:
           begin
-            if Assigned(AValues[I - Skipped].VObject) AND (AValues[I - Skipped].VObject IS TJSON) AND (TJSON(AValues[I - Skipped].VObject).IsObject) then
-              V:=TJSONObject.CreateFrom(TJSON(AValues[I - Skipped].VObject).AsObject)
-            else
+            if Assigned(AValues[I - Skipped].VObject) then
+            begin
+              if (AValues[I - Skipped].VObject IS TJSON) AND (TJSON(AValues[I - Skipped].VObject).IsObject) then
+                V:=TJSONObject.CreateFrom(TJSON(AValues[I - Skipped].VObject).AsObject)
+              else if (AValues[I - Skipped].VObject IS TJSON) AND (TJSON(AValues[I - Skipped].VObject).IsArray) then
+                V:=TJSONValue(TJSON(AValues[I - Skipped].VObject).AsArray).Copy
+              else if AValues[I - Skipped].VObject IS TJSONObject then
+                V:=TJSONObject.CreateFrom(TJSONObject(AValues[I - Skipped].VObject))
+              else if AValues[I - Skipped].VObject IS TJSONArray then
+                V:=TJSONValue(TJSONArray(AValues[I - Skipped].VObject)).Copy
+              else
+                V:=TJSONNull.Create;
+            end else
               V:=TJSONNull.Create;
+          end;
+          vtDynArray:
+          begin
+            // Dynamic arrays cannot be introspected without TypeInfo; create an empty array.
+            // Build the array beforehand as TJSONArray and pass it via vtObject for typed content.
+            V:=TJSONArray.Create;
           end;
           vtClass: V:=TJSONNull.Create;
           vtWideChar: V:=TJSONString.CreateFrom(AValues[I - Skipped].VWideChar);

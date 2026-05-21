@@ -2,7 +2,7 @@
 (*                                                                            *)
 (*  Delphi JSON Parser Class                                                  *)
 (*                                                                            *)
-(*  Version     : 1.08 (2026-05-05)                                           *)
+(*  Version     : 1.09 (2026-05-21)                                           *)
 (*  License     : GPL v3.0                                                    *)
 (*  Author      : NaliLord / DMA (Daniel M.)                                  *)
 (*                                                                            *)
@@ -10,6 +10,12 @@
 (*                                                                            *)
 (*  History:                                                                  *)
 (*  ========================================================================  *)
+(*                                                                            *)
+(*  - 1.09 [2026-05-21] DMA: RTTI object/record support hardening             *)
+(*    New: Added object/record RTTI conversion behind JSON_USE_RTTI           *)
+(*    New: Added LoadFromObject, AssignToObject, AssignToRecord APIs          *)
+(*    New: Added dynamic array support for RTTI object/record fields/props    *)
+(*    Fix: Corrected dynamic-array deserialization in RTTI conversion paths   *)
 (*                                                                            *)
 (*  - 1.08 [2026-05-05] DMA: Bug fixes and feature additions                  *)
 (*    Fix: JSON5 multiline string continuation now correctly consumes \<LF>   *)
@@ -65,7 +71,7 @@ unit XENOME.JSON;
 interface
 
 uses
-  Windows, Messages, SysUtils, Variants, Classes, Registry, IniFiles, SyncObjs, Contnrs, System.Rtti;
+  Windows, Messages, SysUtils, Variants, Classes, Registry, IniFiles, SyncObjs, Contnrs, System.Rtti, System.TypInfo;
 
 type
   TJSONType = (jtNull, jtInteger, jtFloat, jtString, jtBoolean, jtObject, jtArray);
@@ -73,9 +79,20 @@ type
   TJSONTemplateFlag = (tfOmitEmpty);
   TJSONStringWriteMode = (jswmReadable, jswmCondensed);
   TJSONExtension = (jeDefault, jeJSON5);
+  TJSONEnumMode = (jemOrdinal, jemName);
+  TJSONNameCase = (jncPreserve, jncLower, jncUpper, jncPascal, jncCamel, jncSnake, jncScreamingSnake);
+  TJSONUnknownEnumRead = (jurIgnore, jurDefaultFirst, jurRaise);
 
   TJSONTemplateFlags = set of TJSONTemplateFlag;
 
+  TJSONSerializerRules = record
+    EnumMode: TJSONEnumMode;
+    EnumNameCase: TJSONNameCase;
+    EnumStripPrefixes: TArray<String>;
+    EnumAcceptOrdinalOnRead: Boolean;
+    EnumAcceptRawNameOnRead: Boolean;
+    EnumUnknownRead: TJSONUnknownEnumRead;
+  end;
 
   TJSONTemplate = class;
   TJSON = class;
@@ -156,10 +173,17 @@ type
     function GetAsObject: TJSONObject;
     function GetObjectValue(Key: String): TJSONValue;
     function GetArrayValue(Index: Integer): TJSONValue;
+    class function GetSerializerRules: TJSONSerializerRules; static;
+    class procedure SetSerializerRules(const AValue: TJSONSerializerRules); static;
+{$IFDEF JSON_USE_RTTI}
+    class function RTTIRecordToJSON(const AContext: TRttiContext; const AValue: TValue): TJSONObject; static;
+    class procedure RTTIRecordFromJSON(ATargetType: PTypeInfo; ARecord: Pointer; ASource: TJSONObject); static;
+{$ENDIF}
   protected
     procedure Parse;
   public
     class function EncodeString(AString: String): String;
+    class function DefaultSerializerRules: TJSONSerializerRules; static;
     class function CreateTemplate(AName: String): TJSONTemplate;
     class function Template(AName: String): TJSONTemplate;
     constructor Create;
@@ -168,6 +192,8 @@ type
     constructor CreateFromString(AJSON: String; AExtension: TJSONExtension = jeDefault);
     constructor CreateFromFile(AFile: String; AExtension: TJSONExtension = jeDefault);
     constructor CreateFromStream(AStream: TStream; AExtension: TJSONExtension = jeDefault);
+    constructor CreateFromObject(AObject: TObject);
+    class function CreateFromRecord<T>(const ARecord: T): TJSON;
     destructor Destroy; override;
     function IsEmpty: Boolean; virtual;
     function WriteToString(AWriteMode: TJSONStringWriteMode = jswmReadable): String; virtual;
@@ -180,16 +206,20 @@ type
     procedure LoadFromFile(const AFileName: String); virtual;
     procedure LoadFromStream(AStream: TStream); virtual;
     procedure ReadFromString(const AValue: String); virtual;
+    procedure LoadFromObject(AObject: TObject);
+    procedure AssignToObject(AObject: TObject);
+    procedure AssignToRecord<T>(var ARecord: T);
     procedure SaveToFile(const AFileName: String); virtual;
     procedure SaveToStream(AStream: TStream); virtual;
-    property Parser: TJSONExtension                 read FExtension      write FExtension;
-    property ObjectValue[Key: String]: TJSONValue   read GetObjectValue; default;
-    property ArrayValue[Index: Integer]: TJSONValue read GetArrayValue;
-    property Root: TJSONValue                       read FRoot;
-    property IsObject: Boolean                      read GetIsObject;
-    property IsArray: Boolean                       read GetIsArray;
-    property AsObject: TJSONObject                  read GetAsObject;
-    property AsArray: TJSONArray                    read GetAsArray;
+    class property SerializerRules: TJSONSerializerRules read GetSerializerRules write SetSerializerRules;
+    property Parser: TJSONExtension                      read FExtension         write FExtension;
+    property ObjectValue[Key: String]: TJSONValue        read GetObjectValue;                             default;
+    property ArrayValue[Index: Integer]: TJSONValue      read GetArrayValue;
+    property Root: TJSONValue                            read FRoot;
+    property IsObject: Boolean                           read GetIsObject;
+    property IsArray: Boolean                            read GetIsArray;
+    property AsObject: TJSONObject                       read GetAsObject;
+    property AsArray: TJSONArray                         read GetAsArray;
   end;
 
   TJSONValue = class(TPersistent)
@@ -416,7 +446,7 @@ function JsonGetValue(const AName: String; const ADefault: String; const AJSON: 
 implementation
 
 uses
-  System.Math, System.DateUtils, System.StrUtils, System.TypInfo;
+  System.Math, System.DateUtils, System.StrUtils;
 
 { Global }
 
@@ -437,6 +467,7 @@ resourcestring
   RCS_TEMPLATE_NAME_REQUIRED    = 'Error creating template "%s", nested name is required!';
   RCS_TEMPLATE_NAME_NOT_FOUND   = 'Template with name "%s" not found!';
   RCS_TEMPLATE_REQUIRED         = 'A template object is required!';
+  RCS_INVALID_ENUM_VALUE        = 'Invalid enum value "%s" for type "%s"!';
 
 resourcestring
   RCS_INVALID_JSON5_INVALID_IDENTIFIER = 'Invalid identifier found, unexpected character! (%s)';
@@ -497,6 +528,675 @@ begin
   end;
 end;
 
+{$IFDEF JSON_USE_RTTI}
+
+function RTTIGetMemberValue(AObject: TJSONObject; const AName: String): TJSONValue; forward;
+function RTTIIsAccessible(AMember: TRttiMember): Boolean; forward;
+function RTTISerializeValue(const AContext: TRttiContext; const AValue: TValue): TJSONValue; forward;
+function RTTIToJSON(AObject: TObject): TJSONObject; forward;
+procedure RTTIDeserializeJSONArrayToValue(const AContext: TRttiContext; const ATargetType: TRttiType; var ATargetValue: TValue; ASource: TJSONArray); forward;
+function RTTIJSONToValue(const AContext: TRttiContext; ATargetType: TRttiType; ASource: TJSONValue): TValue; forward;
+procedure RTTIFromJSON(ATargetType: TRttiType; ATarget: TObject; ASource: TJSONObject); forward;
+function RTTIIsStringKind(const AKind: TTypeKind): Boolean; forward;
+function RTTIEnumToJSONName(ATypeInfo: PTypeInfo; const AName: String): String; forward;
+function RTTIJSONNameToEnumValue(ATargetType: TRttiType; const AName: String): Integer; forward;
+
+function RTTIIsStringKind(const AKind: TTypeKind): Boolean;
+begin
+  Result := (AKind = tkString)
+    or (AKind = tkLString)
+    or (AKind = tkWString)
+    or (AKind = tkUString)
+    or (AKind = tkAnsiString)
+    or (AKind = tkUnicodeString);
+end;
+
+function RTTIGetMemberValue(AObject: TJSONObject; const AName: String): TJSONValue;
+var
+  I: Integer;
+begin
+  Result:=nil;
+
+  for I:=0 to AObject.Count - 1 do
+  begin
+    if SameText(AObject.Name[I], AName) then
+    begin
+      Result:=AObject.Item[I];
+      Break;
+    end;
+  end;
+end;
+
+function RTTIIsAccessible(AMember: TRttiMember): Boolean;
+begin
+  Result:=Ord(AMember.Visibility) >= 2;
+end;
+
+function RTTISerializeValue(const AContext: TRttiContext; const AValue: TValue): TJSONValue;
+var
+  I: Integer;
+  Val: TValue;
+  Arr: TJSONArray;
+  Raw: PByte;
+  SetOrdinal: Int64;
+begin
+  Result:=nil;
+
+  if AValue.IsEmpty then
+  begin
+    Result:=TJSONNull.Create;
+    Exit;
+  end;
+
+  if RTTIIsStringKind(AValue.Kind) then
+    Result:=TJSONString.CreateFrom(AValue.AsString)
+  else
+  case AValue.Kind of
+    tkClass:
+    begin
+      if AValue.AsObject = nil then
+      begin
+        Result:=TJSONNull.Create;
+      end else
+      begin
+        Result:=RTTIToJSON(AValue.AsObject);
+      end;
+    end;
+    tkRecord:
+    begin
+      Result:=TJSON.RTTIRecordToJSON(AContext, AValue);
+    end;
+    tkArray, tkDynArray:
+    begin
+      Arr:=TJSONArray.Create;
+
+      for I:=0 to AValue.GetArrayLength - 1 do
+      begin
+        Arr.Add(RTTISerializeValue(AContext, AValue.GetArrayElement(I)));
+      end;
+
+      Result:=Arr;
+    end;
+    tkChar, tkWideChar:
+    begin
+      if AValue.AsString <> '' then
+        Result:=TJSONString.CreateFrom(AValue.AsString[1])
+      else
+        Result:=TJSONString.CreateFrom('');
+    end;
+    tkInteger:
+      Result:=TJSONInteger.CreateFrom(AValue.AsOrdinal);
+    tkInt64:
+      Result:=TJSONInteger.CreateFrom(AValue.AsInt64);
+    tkFloat:
+      Result:=TJSONFloat.CreateFrom(AValue.AsExtended);
+    tkEnumeration:
+    begin
+      if AValue.TypeInfo = TypeInfo(Boolean) then
+        Result:=TJSONBoolean.CreateFrom(AValue.AsBoolean)
+      else if TJSON.SerializerRules.EnumMode = jemName then
+        Result:=TJSONString.CreateFrom(RTTIEnumToJSONName(AValue.TypeInfo, GetEnumName(AValue.TypeInfo, AValue.AsOrdinal)))
+      else
+        Result:=TJSONInteger.CreateFrom(AValue.AsOrdinal);
+    end;
+    tkSet:
+    begin
+      SetOrdinal:=0;
+      Raw:=AValue.GetReferenceToRawData;
+      if Assigned(Raw) then
+      begin
+        for I:=0 to Min(AValue.DataSize, SizeOf(SetOrdinal)) - 1 do
+        begin
+          SetOrdinal:=SetOrdinal OR (Int64(Raw^) SHL (I * 8));
+          Inc(Raw);
+        end;
+      end;
+      Result:=TJSONInteger.CreateFrom(SetOrdinal);
+    end;
+    tkVariant:
+    begin
+      try
+        Result:=TJSONString.CreateFrom(VarToStr(AValue.AsVariant));
+      except
+        Result:=TJSONNull.Create;
+      end;
+    end;
+    else
+    begin
+      Result:=TJSONNull.Create;
+    end;
+  end;
+end;
+
+function RTTIToJSON(AObject: TObject): TJSONObject;
+var
+  Context: TRttiContext;
+  RType: TRttiType;
+  Prop: TRttiProperty;
+  Field: TRttiField;
+  V: TJSONValue;
+begin
+  Result:=TJSONObject.Create;
+
+  if Assigned(AObject) then
+  begin
+    Context:=TRttiContext.Create;
+    RType:=Context.GetType(AObject.ClassType);
+
+    for Prop IN RType.GetProperties do
+    begin
+      if NOT RTTIIsAccessible(Prop) then
+        Continue;
+
+      if NOT Prop.IsReadable then
+        Continue;
+
+      try
+        V:=RTTISerializeValue(Context, Prop.GetValue(AObject));
+        if Assigned(V) AND (NOT Result.HasKey(Prop.Name)) then
+          Result.Add(Prop.Name, V);
+      except
+      end;
+    end;
+
+    for Field IN RType.GetFields do
+    begin
+      if NOT RTTIIsAccessible(Field) then
+        Continue;
+
+      try
+        if NOT Result.HasKey(Field.Name) then
+        begin
+          V:=RTTISerializeValue(Context, Field.GetValue(AObject));
+          Result.Add(Field.Name, V);
+        end;
+      except
+      end;
+    end;
+  end;
+end;
+
+class function TJSON.RTTIRecordToJSON(const AContext: TRttiContext; const AValue: TValue): TJSONObject;
+var
+  RType: TRttiType;
+  Fld: TRttiField;
+  V: TJSONValue;
+begin
+  Result:=TJSONObject.Create;
+
+  if AValue.IsEmpty then
+    Exit;
+
+  RType:=AContext.GetType(AValue.TypeInfo);
+
+  for Fld IN RType.GetFields do
+  begin
+    if NOT RTTIIsAccessible(Fld) then
+      Continue;
+
+    try
+      V:=RTTISerializeValue(AContext, Fld.GetValue(AValue.GetReferenceToRawData));
+      if Assigned(V) then
+        Result.Add(Fld.Name, V);
+    except
+    end;
+  end;
+end;
+
+procedure RTTIDeserializeJSONArrayToValue(const AContext: TRttiContext; const ATargetType: TRttiType; var ATargetValue: TValue; ASource: TJSONArray);
+var
+  I: Integer;
+  ArrayLen: Integer;
+  ElemType: TRttiType;
+  ElementValue: TValue;
+  SourceLen: Integer;
+begin
+  if (ATargetType = nil) OR (NOT Assigned(ASource)) OR ATargetValue.IsEmpty then
+    Exit;
+
+  if (ATargetType.TypeKind <> tkArray) AND (ATargetType.TypeKind <> tkDynArray) then
+    Exit;
+
+  case ATargetType.TypeKind of
+    tkArray:
+      ElemType:=TRttiArrayType(ATargetType).ElementType;
+    tkDynArray:
+      ElemType:=TRttiDynamicArrayType(ATargetType).ElementType;
+  else
+    Exit;
+  end;
+
+  if NOT Assigned(ElemType) then
+    Exit;
+
+  ArrayLen:=ATargetValue.GetArrayLength;
+
+  if ArrayLen = 0 then
+    Exit;
+
+  SourceLen:=ASource.Count;
+  if SourceLen < ArrayLen then
+    ArrayLen:=SourceLen;
+
+  if ATargetType.TypeKind = tkArray then
+  begin
+    for I:=0 to ArrayLen - 1 do
+    begin
+      ElementValue:=RTTIJSONToValue(AContext, ElemType, ASource[I]);
+      if NOT ElementValue.IsEmpty then
+        ATargetValue.SetArrayElement(I, ElementValue);
+    end;
+    Exit;
+  end;
+
+  for I:=0 to ArrayLen - 1 do
+  begin
+    ElementValue:=RTTIJSONToValue(AContext, ElemType, ASource[I]);
+    if NOT ElementValue.IsEmpty then
+      ATargetValue.SetArrayElement(I, ElementValue);
+  end;
+end;
+
+function RTTIJSONToValue(const AContext: TRttiContext; ATargetType: TRttiType; ASource: TJSONValue): TValue;
+var
+  LObj: TObject;
+  LString: String;
+  I: Integer;
+  I64: Int64;
+  Dbl: Extended;
+  IObj: TRttiInstanceType;
+  ArrValue: Pointer;
+  ArrLen: Integer;
+  FSingle: Single;
+  FDouble: Double;
+  FExtended: Extended;
+  FCurrency: Currency;
+  Ch: Char;
+  VarValue: Variant;
+begin
+  Result:=TValue.Empty;
+
+  if (ATargetType = nil) OR (NOT Assigned(ASource)) then
+    Exit;
+
+  if RTTIIsStringKind(ATargetType.TypeKind) then
+  begin
+    case ASource.Typ of
+      jtString:
+        Result:=TValue.From<String>(ASource.AsString);
+      jtInteger:
+        Result:=TValue.From<String>(IntToStr(ASource.AsInteger));
+      jtFloat:
+        Result:=TValue.From<String>(FloatToStr(ASource.AsFloat));
+      jtBoolean:
+        Result:=TValue.From<String>(BoolToStr(ASource.AsBoolean, True));
+    end;
+    Exit;
+  end;
+
+  case ATargetType.TypeKind of
+    tkInteger:
+    begin
+      if ASource.Typ = jtInteger then
+        Result:=TValue.FromOrdinal(ATargetType.Handle, ASource.AsInteger);
+      if ASource.Typ = jtFloat then
+        Result:=TValue.FromOrdinal(ATargetType.Handle, Trunc(ASource.AsFloat));
+      if ASource.Typ = jtString then
+      begin
+        LString:=Trim(ASource.AsString);
+        if TryStrToInt64(LString, I64) then
+          Result:=TValue.FromOrdinal(ATargetType.Handle, Integer(I64));
+      end;
+    end;
+    tkInt64:
+    begin
+      if ASource.Typ IN [jtInteger, jtFloat] then
+      begin
+        if ASource.Typ = jtInteger then
+          Result:=TValue.From<Int64>(ASource.AsInteger)
+        else
+          Result:=TValue.From<Int64>(Trunc(ASource.AsFloat));
+      end;
+      if ASource.Typ = jtString then
+      begin
+        LString:=Trim(ASource.AsString);
+        if TryStrToInt64(LString, I64) then
+          Result:=TValue.From<Int64>(I64);
+      end;
+    end;
+    tkFloat:
+    begin
+      if ASource.Typ IN [jtInteger, jtFloat] then
+      begin
+        if ASource.Typ = jtInteger then
+          Dbl:=ASource.AsInteger
+        else
+          Dbl:=ASource.AsFloat;
+      end
+      else if ASource.Typ = jtString then
+      begin
+        LString:=Trim(ASource.AsString);
+        if NOT TryStrToFloat(LString, Dbl) then
+          Exit;
+      end else
+        Exit;
+
+      case GetTypeData(ATargetType.Handle)^.FloatType of
+        ftSingle:
+        begin
+          FSingle:=Dbl;
+          TValue.Make(@FSingle, ATargetType.Handle, Result);
+        end;
+        ftDouble:
+        begin
+          FDouble:=Dbl;
+          TValue.Make(@FDouble, ATargetType.Handle, Result);
+        end;
+        ftExtended:
+        begin
+          FExtended:=Dbl;
+          TValue.Make(@FExtended, ATargetType.Handle, Result);
+        end;
+        ftComp:
+        begin
+          I64:=Round(Dbl);
+          TValue.Make(@I64, ATargetType.Handle, Result);
+        end;
+        ftCurr:
+        begin
+          FCurrency:=Dbl;
+          TValue.Make(@FCurrency, ATargetType.Handle, Result);
+        end;
+      end;
+    end;
+    tkChar, tkWideChar:
+    begin
+      if ASource.Typ = jtString then
+      begin
+        if ASource.AsString <> '' then
+        begin
+          Ch:=ASource.AsString[1];
+          TValue.Make(@Ch, ATargetType.Handle, Result);
+        end;
+      end;
+    end;
+    tkEnumeration:
+    begin
+      I:=-1;
+      if ATargetType.Handle = TypeInfo(Boolean) then
+      begin
+        if ASource.Typ = jtBoolean then
+          Result:=TValue.From<Boolean>(ASource.AsBoolean)
+        else if ASource.Typ = jtInteger then
+          Result:=TValue.From<Boolean>(ASource.AsInteger <> 0)
+        else if ASource.Typ = jtString then
+        begin
+          LString:=LowerCase(Trim(ASource.AsString));
+          if LString = 'true' then
+            Result:=TValue.From<Boolean>(True)
+          else if LString = 'false' then
+            Result:=TValue.From<Boolean>(False);
+        end
+      end else
+      begin
+        if ASource.Typ = jtString then
+          I:=RTTIJSONNameToEnumValue(ATargetType, ASource.AsString)
+        else if ASource.Typ IN [jtInteger, jtFloat, jtBoolean] then
+        begin
+          if TJSON.SerializerRules.EnumAcceptOrdinalOnRead then
+            I:=ASource.AsInteger;
+        end;
+
+        if I >= 0 then
+          Result:=TValue.FromOrdinal(ATargetType.Handle, I)
+        else
+        case TJSON.SerializerRules.EnumUnknownRead of
+          jurDefaultFirst:
+            Result:=TValue.FromOrdinal(ATargetType.Handle, GetTypeData(ATargetType.Handle)^.MinValue);
+          jurRaise:
+            raise Exception.Create(Format(RCS_INVALID_ENUM_VALUE, [ASource.AsString, ATargetType.Name]));
+        end;
+      end;
+    end;
+    tkSet:
+    begin
+      I:=-1;
+      if ASource.Typ = jtString then
+        TryStrToInt(Trim(ASource.AsString), I)
+      else if ASource.Typ IN [jtInteger, jtFloat, jtBoolean] then
+        I:=ASource.AsInteger;
+
+      if I >= 0 then
+      begin
+        I64:=I;
+        TValue.Make(@I64, ATargetType.Handle, Result);
+      end;
+    end;
+    tkVariant:
+    begin
+      case ASource.Typ of
+        jtNull: VarValue:=Null;
+        jtInteger: VarValue:=ASource.AsInteger;
+        jtFloat: VarValue:=ASource.AsFloat;
+        jtString: VarValue:=ASource.AsString;
+        jtBoolean: VarValue:=ASource.AsBoolean;
+      else
+        VarValue:=Null;
+      end;
+      Result:=TValue.FromVariant(VarValue);
+    end;
+    tkClass:
+    begin
+      if ASource.Typ = jtNull then
+        Exit;
+
+      if (ATargetType.Handle = TypeInfo(TJSONValue)) AND (ASource IS TJSONValue) then
+      begin
+        TValue.Make(@ASource, ATargetType.Handle, Result);
+        Exit;
+      end;
+
+      if (ATargetType.Handle = TypeInfo(TJSONObject)) AND (ASource IS TJSONObject) then
+      begin
+        TValue.Make(@ASource, ATargetType.Handle, Result);
+        Exit;
+      end;
+
+      if (ATargetType.Handle = TypeInfo(TJSONArray)) AND (ASource IS TJSONArray) then
+      begin
+        TValue.Make(@ASource, ATargetType.Handle, Result);
+        Exit;
+      end;
+
+      if NOT (ATargetType IS TRttiInstanceType) then
+        Exit;
+
+      if ASource.Typ <> jtObject then
+        Exit;
+
+      IObj:=TRttiInstanceType(ATargetType);
+      try
+        LObj:=IObj.MetaclassType.Create;
+      except
+        Exit;
+      end;
+
+      try
+        RTTIFromJSON(ATargetType, LObj, TJSONObject(ASource));
+        TValue.Make(@LObj, ATargetType.Handle, Result);
+      except
+        LObj.Free;
+        Exit;
+      end;
+    end;
+    tkArray, tkDynArray:
+    begin
+      if ASource.Typ <> jtArray then
+        Exit;
+
+      if ATargetType.TypeKind = tkDynArray then
+      begin
+        ArrLen:=ASource.AsArray.Count;
+        ArrValue:=nil;
+        DynArraySetLength(ArrValue, ATargetType.Handle, 1, @ArrLen);
+        TValue.Make(@ArrValue, ATargetType.Handle, Result);
+        RTTIDeserializeJSONArrayToValue(AContext, ATargetType, Result, ASource.AsArray);
+      end;
+    end;
+    tkRecord: Exit;
+  end;
+end;
+
+procedure RTTIFromJSON(ATargetType: TRttiType; ATarget: TObject; ASource: TJSONObject);
+var
+  Context: TRttiContext;
+  Prop: TRttiProperty;
+  Field: TRttiField;
+  Source: TJSONValue;
+  NewValue: TValue;
+begin
+  if (ATarget = nil) OR (ASource = nil) then
+    Exit;
+
+  Context:=TRttiContext.Create;
+  for Prop IN Context.GetType(ATarget.ClassType).GetProperties do
+  begin
+    if NOT RTTIIsAccessible(Prop) then
+      Continue;
+
+    if (NOT Prop.IsWritable) OR (NOT Prop.IsReadable) then
+      Continue;
+
+    Source:=RTTIGetMemberValue(ASource, Prop.Name);
+    if Source = nil then
+      Continue;
+
+    try
+      if Prop.PropertyType.TypeKind = tkDynArray then
+      begin
+        if Source IS TJSONArray then
+        begin
+          NewValue:=RTTIJSONToValue(Context, Prop.PropertyType, Source);
+          if NOT NewValue.IsEmpty then
+            Prop.SetValue(ATarget, NewValue);
+        end;
+      end
+      else if Prop.PropertyType.TypeKind = tkArray then
+      begin
+        if Source IS TJSONArray then
+        begin
+          NewValue:=Prop.GetValue(ATarget);
+          RTTIDeserializeJSONArrayToValue(Context, Prop.PropertyType, NewValue, TJSONArray(Source));
+          Prop.SetValue(ATarget, NewValue);
+        end;
+      end
+      else
+      begin
+        NewValue:=RTTIJSONToValue(Context, Prop.PropertyType, Source);
+
+        if NOT NewValue.IsEmpty then
+          Prop.SetValue(ATarget, NewValue);
+      end;
+    except
+    end;
+  end;
+
+  for Field IN Context.GetType(ATarget.ClassType).GetFields do
+  begin
+    if NOT RTTIIsAccessible(Field) then
+      Continue;
+
+    Source:=RTTIGetMemberValue(ASource, Field.Name);
+    if Source = nil then
+      Continue;
+
+    try
+      if Field.FieldType.TypeKind = tkDynArray then
+      begin
+        if Source IS TJSONArray then
+        begin
+          NewValue:=RTTIJSONToValue(Context, Field.FieldType, Source);
+          if NOT NewValue.IsEmpty then
+            Field.SetValue(ATarget, NewValue);
+        end;
+      end
+      else if Field.FieldType.TypeKind = tkArray then
+      begin
+        if Source IS TJSONArray then
+        begin
+          NewValue:=Field.GetValue(ATarget);
+          RTTIDeserializeJSONArrayToValue(Context, Field.FieldType, NewValue, TJSONArray(Source));
+          Field.SetValue(ATarget, NewValue);
+        end;
+      end
+      else
+      begin
+        NewValue:=RTTIJSONToValue(Context, Field.FieldType, Source);
+
+        if NOT NewValue.IsEmpty then
+          Field.SetValue(ATarget, NewValue);
+      end;
+    except
+    end;
+  end;
+
+end;
+
+class procedure TJSON.RTTIRecordFromJSON(ATargetType: PTypeInfo; ARecord: Pointer; ASource: TJSONObject);
+var
+  Context: TRttiContext;
+  RType: TRttiType;
+  Fld: TRttiField;
+  Source: TJSONValue;
+  NewValue: TValue;
+begin
+  if (ATargetType = nil) OR (ARecord = nil) OR (ASource = nil) then
+    Exit;
+
+  Context:=TRttiContext.Create;
+  RType:=Context.GetType(PTypeInfo(ATargetType));
+
+  for Fld IN RType.GetFields do
+  begin
+    if NOT RTTIIsAccessible(Fld) then
+      Continue;
+
+    Source:=RTTIGetMemberValue(ASource, Fld.Name);
+    if Source = nil then
+      Continue;
+
+    if Fld.FieldType.TypeKind = tkDynArray then
+    begin
+      if Source IS TJSONArray then
+      begin
+        NewValue:=RTTIJSONToValue(Context, Fld.FieldType, Source);
+        if NOT NewValue.IsEmpty then
+          Fld.SetValue(ARecord, NewValue);
+      end;
+    end
+    else if Fld.FieldType.TypeKind = tkArray then
+    begin
+      if Source IS TJSONArray then
+      begin
+        NewValue:=Fld.GetValue(ARecord);
+        RTTIDeserializeJSONArrayToValue(Context, Fld.FieldType, NewValue, TJSONArray(Source));
+        Fld.SetValue(ARecord, NewValue);
+      end;
+    end
+    else
+    begin
+      NewValue:=RTTIJSONToValue(Context, Fld.FieldType, Source);
+      if NOT NewValue.IsEmpty then
+        Fld.SetValue(ARecord, NewValue);
+    end;
+  end;
+end;
+
+{$ELSE}
+
+{$MESSAGE WARN 'JSON_USE_RTTI is not defined. RTTI-based object/record JSON mapping will be disabled.'}
+
+{$ENDIF}
 { Parser }
 
 type
@@ -583,6 +1283,7 @@ type
 
 var
   GlobTemplates: TJSONTemplatesList = nil;
+  GlobSerializerRules: TJSONSerializerRules;
 
 { TJSONParser }
 
@@ -629,8 +1330,10 @@ function TJSONParser.ParseString: String;
 var
   I: Integer;
   Unicode: String;
+  Closed: Boolean;
 begin
   Result:='';
+  Closed:=False;
 
   while HasData do
   begin
@@ -639,6 +1342,7 @@ begin
     case FBuffer of
       '"':
       begin
+        Closed:=True;
         Break;
       end;
       '\':
@@ -692,12 +1396,114 @@ begin
       end;
     end;
   end;
+
+  if NOT Closed then
+    raise EJSONException.Create(RCS_UNEXPECTED_END_OF_FILE, FLineCount, FCharCount);
+end;
+
+function RTTIStripEnumPrefix(const AName: String): String;
+var
+  Prefix: String;
+begin
+  Result:=AName;
+
+  for Prefix IN TJSON.SerializerRules.EnumStripPrefixes do
+  begin
+    if (Prefix <> '') AND StartsText(Prefix, Result) then
+    begin
+      Delete(Result, 1, Length(Prefix));
+      Break;
+    end;
+  end;
+end;
+
+function RTTIToSnakeCase(const AName: String; const AUpper: Boolean): String;
+var
+  I: Integer;
+  Ch: Char;
+begin
+  Result:='';
+
+  for I:=1 to Length(AName) do
+  begin
+    Ch:=AName[I];
+
+    if (I > 1) AND CharInSet(Ch, ['A'..'Z']) AND
+       (CharInSet(AName[I - 1], ['a'..'z', '0'..'9']) OR ((I < Length(AName)) AND CharInSet(AName[I + 1], ['a'..'z']))) then
+      Result:=Result + '_';
+
+    Result:=Result + Ch;
+  end;
+
+  if AUpper then
+    Result:=UpperCase(Result)
+  else
+    Result:=LowerCase(Result);
+end;
+
+function RTTIApplyNameCase(const AName: String): String;
+begin
+  Result:=AName;
+
+  case TJSON.SerializerRules.EnumNameCase of
+    jncLower: Result:=LowerCase(Result);
+    jncUpper: Result:=UpperCase(Result);
+    jncPascal:
+    begin
+      if Result <> '' then
+        Result[1]:=UpCase(Result[1]);
+    end;
+    jncCamel:
+    begin
+      if Result <> '' then
+        Result[1]:=LowerCase(Result[1])[1];
+    end;
+    jncSnake: Result:=RTTIToSnakeCase(Result, False);
+    jncScreamingSnake: Result:=RTTIToSnakeCase(Result, True);
+  end;
+end;
+
+function RTTIEnumToJSONName(ATypeInfo: PTypeInfo; const AName: String): String;
+begin
+  Result:=RTTIApplyNameCase(RTTIStripEnumPrefix(AName));
+end;
+
+function RTTIJSONNameToEnumValue(ATargetType: TRttiType; const AName: String): Integer;
+var
+  TypeData: PTypeData;
+  I: Integer;
+  RawName: String;
+begin
+  Result:=-1;
+
+  if TJSON.SerializerRules.EnumAcceptRawNameOnRead then
+  begin
+    Result:=GetEnumValue(ATargetType.Handle, AName);
+    if Result >= 0 then
+      Exit;
+  end;
+
+  TypeData:=GetTypeData(ATargetType.Handle);
+  if TypeData = nil then
+    Exit;
+
+  for I:=TypeData^.MinValue to TypeData^.MaxValue do
+  begin
+    RawName:=GetEnumName(ATargetType.Handle, I);
+    if SameText(RTTIEnumToJSONName(ATargetType.Handle, RawName), AName) then
+    begin
+      Result:=I;
+      Exit;
+    end;
+  end;
 end;
 
 procedure TJSONParser.ParseObject(AObj: TJSONObject);
 var
   Key: String;
+  Closed: Boolean;
 begin
+  Closed:=False;
   Expect([jcDoubleQuote, jcRightBrace]);
 
   while HasData do
@@ -726,6 +1532,7 @@ begin
       '}': // End of object
       begin
         IsExpected;
+        Closed:=True;
         Exit;
       end;
       #10:
@@ -744,10 +1551,16 @@ begin
       end;
     end;
   end;
+
+  if NOT Closed then
+    raise EJSONException.Create(RCS_UNEXPECTED_END_OF_FILE, FLineCount, FCharCount);
 end;
 
 procedure TJSONParser.ParseArray(AArr: TJSONArray);
+var
+  Closed: Boolean;
 begin
+  Closed:=False;
   Expect([jcRightBracket]);
 
   while HasData do
@@ -758,6 +1571,7 @@ begin
       ']':
       begin
         IsExpected;
+        Closed:=True;
         Break;
       end;
       ',':
@@ -784,6 +1598,9 @@ begin
       end;
     end;
   end;
+
+  if NOT Closed then
+    raise EJSONException.Create(RCS_UNEXPECTED_END_OF_FILE, FLineCount, FCharCount);
 end;
 
 function TJSONParser.ParseValue: TJSONValue;
@@ -793,6 +1610,8 @@ var
   Typ: TJSONType;
   Obj: TJSONObject;
   Arr: TJSONArray;
+  I64: Int64;
+  Ext: Extended;
 begin
   Result:=nil;
   Value:='';
@@ -855,8 +1674,18 @@ begin
         end;
 
         case Typ of
-          jtInteger: Result:=TJSONInteger.CreateFrom(StrToInt64Def(Value, 0));
-          jtFloat: Result:=TJSONFloat.CreateFrom(StrToFloatDef(Value, 0, TFormatSettings.Create(JSON_DEFAULT_LOCALE)));
+          jtInteger:
+          begin
+            if NOT TryStrToInt64(Value, I64) then
+              raise EJSONException.Create(RCS_INVALID_NUMERIC_VALUE, FLineCount, FCharCount);
+            Result:=TJSONInteger.CreateFrom(I64);
+          end;
+          jtFloat:
+          begin
+            if NOT TryStrToFloat(Value, Ext, TFormatSettings.Create(JSON_DEFAULT_LOCALE)) then
+              raise EJSONException.Create(RCS_INVALID_NUMERIC_VALUE, FLineCount, FCharCount);
+            Result:=TJSONFloat.CreateFrom(Ext);
+          end;
         end;
 
         Break;
@@ -934,12 +1763,15 @@ begin
       begin
         Continue;
       end;
-      else // Unknown char, break
+      else // Unknown char
       begin
-        Break;
+        raise EJSONException.Create(Format(RCS_INVALID_CHARACTER, [FBuffer]), FLineCount, FCharCount);
       end;
     end;
   until NOT HasData;
+
+  if Result = nil then
+    raise EJSONException.Create(RCS_UNEXPECTED_END_OF_FILE, FLineCount, FCharCount);
 end;
 
 procedure TJSONParser.InternalParse(AJSON: TJSON);
@@ -1144,8 +1976,10 @@ end;
 procedure TJSON5Parser.ParseArray(AArr: TJSONArray);
 var
   IsComment: Boolean;
+  Closed: Boolean;
 begin
   IsComment:=False;
+  Closed:=False;
   Expect([jc5RightBracket]);
 
   while HasData do
@@ -1157,6 +1991,7 @@ begin
       begin
         if IsComment then Continue;
         IsExpected;
+        Closed:=True;
         Break;
       end;
       '/':
@@ -1202,6 +2037,9 @@ begin
       end;
     end;
   end;
+
+  if NOT Closed then
+    raise EJSONException.Create(RCS_UNEXPECTED_END_OF_FILE, FLineCount, FCharCount);
 end;
 
 function TJSON5Parser.ParseIdentifier: String;
@@ -1233,8 +2071,10 @@ procedure TJSON5Parser.ParseObject(AObj: TJSONObject);
 var
   Key: String;
   IsComment: Boolean;
+  Closed: Boolean;
 begin
   IsComment:=False;
+  Closed:=False;
 
   Expect([jc5DoubleQuote, jc5SingleQuote, jc5RightBrace, jc5Comment, jc5SingleQuote, jc5Identifier]);
 
@@ -1291,6 +2131,7 @@ begin
       begin
         if IsComment then Continue;
         IsExpected;
+        Closed:=True;
         Exit;
       end;
       #10:
@@ -1311,6 +2152,9 @@ begin
       end;
     end;
   end;
+
+  if NOT Closed then
+    raise EJSONException.Create(RCS_UNEXPECTED_END_OF_FILE, FLineCount, FCharCount);
 end;
 
 function TJSON5Parser.ParseString: String;
@@ -1318,10 +2162,12 @@ var
   I: Integer;
   Unicode: String;
   SingleQuoted: Boolean;
+  Closed: Boolean;
 begin
   Result:='';
 
   SingleQuoted:=FBuffer = JSON5_CHARS[jc5SingleQuote];
+  Closed:=False;
 
   while HasData do
   begin
@@ -1331,10 +2177,16 @@ begin
       '"', '''':
       begin
         if SingleQuoted AND (FBuffer = JSON5_CHARS[jc5SingleQuote]) then
+        begin
+          Closed:=True;
           Break;
+        end;
 
         if NOT SingleQuoted AND (FBuffer = JSON5_CHARS[jc5DoubleQuote]) then
+        begin
+          Closed:=True;
           Break;
+        end;
 
         Result:=Result + Char(FBuffer);
       end;
@@ -1423,6 +2275,9 @@ begin
       end;
     end;
   end;
+
+  if NOT Closed then
+    raise EJSONException.Create(RCS_UNEXPECTED_END_OF_FILE, FLineCount, FCharCount);
 end;
 
 function TJSON5Parser.ParseValue: TJSONValue;
@@ -1433,6 +2288,8 @@ var
   Obj: TJSONObject;
   Arr: TJSONArray;
   IsNeg: Boolean;
+  I64: Int64;
+  Ext: Extended;
 begin
   Result:=nil;
   Value:='';
@@ -1560,8 +2417,18 @@ begin
 
         if Result = nil then
           case Typ of
-            jtInteger: Result:=TJSONInteger.CreateFrom(StrToInt64Def(Value, 0));
-            jtFloat: Result:=TJSONFloat.CreateFrom(StrToFloatDef(Value, 0, TFormatSettings.Create(JSON_DEFAULT_LOCALE)));
+            jtInteger:
+            begin
+              if NOT TryStrToInt64(Value, I64) then
+                raise EJSONException.Create(RCS_INVALID_NUMERIC_VALUE, FLineCount, FCharCount);
+              Result:=TJSONInteger.CreateFrom(I64);
+            end;
+            jtFloat:
+            begin
+              if NOT TryStrToFloat(Value, Ext, TFormatSettings.Create(JSON_DEFAULT_LOCALE)) then
+                raise EJSONException.Create(RCS_INVALID_NUMERIC_VALUE, FLineCount, FCharCount);
+              Result:=TJSONFloat.CreateFrom(Ext);
+            end;
           end;
 
         Break;
@@ -1643,12 +2510,15 @@ begin
       begin
         Continue;
       end;
-      else // Unknown char, break
+      else // Unknown char
       begin
-        Break;
+        raise EJSONException.Create(Format(RCS_INVALID_CHARACTER, [FBuffer]), FLineCount, FCharCount);
       end;
     end;
   until NOT HasData;
+
+  if Result = nil then
+    raise EJSONException.Create(RCS_UNEXPECTED_END_OF_FILE, FLineCount, FCharCount);
 end;
 
 { TJSONWriter }
@@ -1900,6 +2770,26 @@ begin
   end;
 end;
 
+class function TJSON.DefaultSerializerRules: TJSONSerializerRules;
+begin
+  Result.EnumMode:=jemOrdinal;
+  Result.EnumNameCase:=jncPreserve;
+  SetLength(Result.EnumStripPrefixes, 0);
+  Result.EnumAcceptOrdinalOnRead:=True;
+  Result.EnumAcceptRawNameOnRead:=True;
+  Result.EnumUnknownRead:=jurIgnore;
+end;
+
+class function TJSON.GetSerializerRules: TJSONSerializerRules;
+begin
+  Result:=GlobSerializerRules;
+end;
+
+class procedure TJSON.SetSerializerRules(const AValue: TJSONSerializerRules);
+begin
+  GlobSerializerRules:=AValue;
+end;
+
 class function TJSON.CreateTemplate(AName: String): TJSONTemplate;
 begin
   Result:=TJSONTemplate.Create(AName);
@@ -1955,6 +2845,35 @@ begin
   FRoot:=TJSONObject.Create;
 end;
 
+constructor TJSON.CreateFromObject(AObject: TObject);
+begin
+  Create;
+
+  LoadFromObject(AObject);
+end;
+
+class function TJSON.CreateFromRecord<T>(const ARecord: T): TJSON;
+{$IFDEF JSON_USE_RTTI}
+var
+  Context: TRttiContext;
+  RecordValue: TValue;
+{$ENDIF}
+begin
+  Result:=Create;
+
+  Result.RootNewObject;
+{$IFDEF JSON_USE_RTTI}
+
+  RecordValue:=TValue.From<T>(ARecord);
+    if NOT RecordValue.IsEmpty then
+    begin
+      Context:=TRttiContext.Create;
+      FreeAndNil(Result.FRoot);
+      Result.FRoot:=TJSON.RTTIRecordToJSON(Context, RecordValue);
+    end;
+{$ENDIF}
+end;
+
 destructor TJSON.Destroy;
 begin
   Clear;
@@ -2003,8 +2922,24 @@ begin
 end;
 
 procedure TJSON.Assign(ASource: TPersistent);
+var
+  LSource: TJSON;
 begin
-  inherited;
+  if (ASource <> nil) AND (ASource is TJSON) then
+  begin
+    LSource:=TJSON(ASource);
+
+    FCritSec.Enter;
+    try
+      Clear;
+      FExtension:=LSource.FExtension;
+      if Assigned(LSource.FRoot) then
+        FRoot:=LSource.FRoot.Copy;
+    finally
+      FCritSec.Leave;
+    end;
+  end else
+    inherited;
 end;
 
 procedure TJSON.Clear;
@@ -2100,6 +3035,61 @@ begin
   Result:=TJSONObject.Create;
 
   FRoot:=Result;
+end;
+
+procedure TJSON.LoadFromObject(AObject: TObject);
+begin
+  Clear;
+
+  FCritSec.Enter;
+  try
+{$IFNDEF JSON_USE_RTTI}
+    FRoot:=TJSONObject.Create;
+{$ELSE}
+    if Assigned(AObject) then
+      FRoot:=RTTIToJSON(AObject)
+    else
+      FRoot:=TJSONObject.Create;
+{$ENDIF}
+  finally
+    FCritSec.Leave;
+  end;
+end;
+
+procedure TJSON.AssignToObject(AObject: TObject);
+{$IFDEF JSON_USE_RTTI}
+var
+  Ctxt: TRttiContext;
+  TargetType: TRttiType;
+{$ENDIF}
+begin
+  FCritSec.Enter;
+  try
+    if Assigned(AObject) AND IsObject then
+    begin
+{$IFDEF JSON_USE_RTTI}
+      Ctxt:=TRttiContext.Create;
+      TargetType:=Ctxt.GetType(AObject.ClassType);
+      if Assigned(TargetType) then
+        RTTIFromJSON(TargetType, AObject, AsObject);
+{$ENDIF}
+    end;
+  finally
+    FCritSec.Leave;
+  end;
+end;
+
+procedure TJSON.AssignToRecord<T>(var ARecord: T);
+begin
+  FCritSec.Enter;
+  try
+  {$IFDEF JSON_USE_RTTI}
+    if IsObject then
+      TJSON.RTTIRecordFromJSON(TypeInfo(T), @ARecord, AsObject);
+  {$ENDIF}
+  finally
+    FCritSec.Leave;
+  end;
 end;
 
 procedure TJSON.SaveToFile(const AFileName: String);
@@ -2880,7 +3870,7 @@ begin
   Parts:=APath.Split(['.']);
   Current:=Self;
 
-  for Part in Parts do
+  for Part IN Parts do
   begin
     if Current = nil then
       Exit;
@@ -3429,12 +4419,14 @@ begin
             end else
               V:=TJSONNull.Create;
           end;
+{$IF DECLARED(vtDynArray)}
           vtDynArray:
           begin
             // Dynamic arrays cannot be introspected without TypeInfo; create an empty array.
-            // Build the array beforehand as TJSONArray and pass it via vtObject for typed content.
+            // Build the array beforehand as a TJSONArray and pass it via vtObject for typed content.
             V:=TJSONArray.Create;
           end;
+{$ENDIF}
           vtClass: V:=TJSONNull.Create;
           vtWideChar: V:=TJSONString.CreateFrom(AValues[I - Skipped].VWideChar);
           vtPWideChar: V:=TJSONString.CreateFrom(String(AValues[I - Skipped].VPWideChar));
@@ -3499,49 +4491,62 @@ end;
 
 function TJSONTemplate.SetValue(AName: String; const AValue: Variant): Boolean;
 var
-  V: TJSONValue;
   I: Integer;
+  V: TJSONValue;
+  TargetIndex: Integer;
 begin
   Result:=False;
-
-  case VarType(AValue) of
-    varSmallInt,
-    varShortInt,
-    varInteger,
-    varByte,
-    varWord,
-    varLongWord,
-    varInt64,
-    varUInt64: V:=TJSONInteger.CreateFrom(AValue);
-
-    varSingle,
-    varDouble,
-    varCurrency,
-    varDate: V:=TJSONFloat.CreateFrom(AValue);
-
-    varBoolean: V:=TJSONBoolean.CreateFrom(AValue);
-
-    varOleStr,
-    varString,
-    varUString: V:=TJSONString.CreateFrom(AValue);
-
-    else
-      V:=TJSONNull.Create;
-  end;
+  TargetIndex:=-1;
 
   for I:=0 to High(FValues) do
   begin
-    if AnsiSameText(FValues[I].Name, AName) AND (FValues[I].Typ = JSON_TYPE_TO_TEMPLATE_TYPE[V.Typ]) then
+    if AnsiSameText(FValues[I].Name, AName) then
+    begin
+      TargetIndex:=I;
+      Break;
+    end;
+  end;
+
+  if TargetIndex >= 0 then
+  begin
+    case VarType(AValue) of
+      varSmallInt,
+      varShortInt,
+      varInteger,
+      varByte,
+      varWord,
+      varLongWord,
+      varInt64,
+      varUInt64: V:=TJSONInteger.CreateFrom(AValue);
+
+      varSingle,
+      varDouble,
+      varCurrency,
+      varDate: V:=TJSONFloat.CreateFrom(AValue);
+
+      varBoolean: V:=TJSONBoolean.CreateFrom(AValue);
+
+      varOleStr,
+      varString,
+      varUString: V:=TJSONString.CreateFrom(AValue);
+
+      else
+        V:=TJSONNull.Create;
+    end;
+
+    if FValues[TargetIndex].Typ = JSON_TYPE_TO_TEMPLATE_TYPE[V.Typ] then
     begin
       FJSON.AsObject.SetOrAdd(AName, V);
       Result:=True;
-      Break;
-    end;
+    end
+    else
+      V.Free;
   end;
 end;
 
 initialization
   GlobTemplates:=TJSONTemplatesList.Create;
+  GlobSerializerRules:=TJSON.DefaultSerializerRules;
 
 finalization
   FreeAndNil(GlobTemplates);
